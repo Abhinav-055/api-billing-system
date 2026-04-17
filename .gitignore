@@ -1,0 +1,32 @@
+# Environment
+.env
+.env.*
+!.env.example
+
+# Go
+**/bin/
+**/dist/
+**/vendor/
+**/*.test
+**/*.out
+coverage.out
+.coverprofile
+
+# Node / Frontend
+**/node_modules/
+**/.next/
+**/out/
+**/.turbo/
+**/.pnpm-store/
+**/coverage/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Docker
+**/.docker/
+**/tmp/
+**/logs/

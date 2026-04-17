@@ -1,0 +1,45 @@
+syntax = "proto3";
+
+package wallet;
+
+option go_package = "./proto/wallet";
+
+service WalletService {
+  rpc CheckBalance (BalanceRequest) returns (BalanceResponse);
+  rpc DeductBalance (DeductRequest) returns (DeductResponse);
+  rpc CreditBalance (CreditRequest) returns (CreditResponse);
+}
+
+message BalanceRequest {
+  string user_id = 1;
+}
+
+message BalanceResponse {
+  string user_id = 1;
+  double balance = 2;
+  bool has_sufficient_funds = 3;
+}
+
+message DeductRequest {
+  string user_id = 1;
+  double amount = 2;
+  string idempotency_key = 3;
+}
+
+message DeductResponse {
+  bool success = 1;
+  double new_balance = 2;
+  string error = 3;
+}
+
+message CreditRequest {
+  string user_id = 1;
+  double amount = 2;
+  string idempotency_key = 3;
+}
+
+message CreditResponse {
+  bool success = 1;
+  double new_balance = 2;
+  string error = 3;
+}

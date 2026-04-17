@@ -1,0 +1,10 @@
+go 1.23.0
+
+use (
+	./pkg
+	./proto
+	./services/api-gateway
+	./services/billing-service
+	./services/payment-service
+	./services/wallet-service
+)

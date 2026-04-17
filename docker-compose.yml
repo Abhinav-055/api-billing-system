@@ -1,0 +1,127 @@
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - apibilling
+
+  nats:
+    image: nats:2.10-alpine
+    command: ["-js"]
+    ports:
+      - "4222:4222"
+    volumes:
+      - nats_data:/data
+    networks:
+      - apibilling
+
+  couchbase:
+    image: couchbase:community-7.6.2
+    ports:
+      - "8091:8091"
+      - "8092:8092"
+      - "8093:8093"
+      - "8094:8094"
+      - "11210:11210"
+    volumes:
+      - couchbase_data:/opt/couchbase/var
+    networks:
+      - apibilling
+
+  nginx:
+    build:
+      context: .
+      dockerfile: nginx/Dockerfile
+    ports:
+      - "80:80"
+    depends_on:
+      - api-gateway
+      - payment-service
+      - frontend
+    networks:
+      - apibilling
+
+  api-gateway:
+    build:
+      context: .
+      dockerfile: docker/api-gateway/Dockerfile
+    env_file:
+      - .env
+    ports:
+      - "8080:8080"
+    depends_on:
+      - redis
+      - nats
+    networks:
+      - apibilling
+
+  billing-service:
+    build:
+      context: .
+      dockerfile: docker/billing-service/Dockerfile
+    env_file:
+      - .env
+    ports:
+      - "8082:8082"
+    depends_on:
+      - nats
+      - couchbase
+    networks:
+      - apibilling
+
+  wallet-service:
+    build:
+      context: .
+      dockerfile: docker/wallet-service/Dockerfile
+    env_file:
+      - .env
+    ports:
+      - "9090:9090"
+    depends_on:
+      - couchbase
+    networks:
+      - apibilling
+
+  payment-service:
+    build:
+      context: .
+      dockerfile: docker/payment-service/Dockerfile
+    env_file:
+      - .env
+    ports:
+      - "8083:8083"
+    depends_on:
+      - nats
+      - couchbase
+    networks:
+      - apibilling
+
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/frontend/Dockerfile
+    env_file:
+      - .env
+    environment:
+      - BACKEND_URL=http://api-gateway:8080
+      - PAYMENT_URL=http://payment-service:8083
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api-gateway
+      - payment-service
+    networks:
+      - apibilling
+
+networks:
+  apibilling:
+    driver: bridge
+
+volumes:
+  redis_data:
+  nats_data:
+  couchbase_data:
