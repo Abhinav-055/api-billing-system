@@ -849,16 +849,26 @@ func (a *app) fetchUsageRows(parent context.Context, userID string, limit int, o
 	}
 
 	if endpoint != "" {
-		base += " AND endpoint = $endpoint"
+		base += " AND CONTAINS(LOWER(endpoint), LOWER($endpoint))"
 		named["endpoint"] = endpoint
 	}
 	if startDate != "" {
-		base += " AND DATE_STR(timestamp) >= $start_date"
-		named["start_date"] = startDate
+		start, err := time.Parse("2006-01-02", startDate)
+		if err != nil {
+			return nil, fmt.Errorf("invalid start_date: %w", err)
+		}
+
+		base += " AND STR_TO_MILLIS(timestamp) >= STR_TO_MILLIS($start_date)"
+		named["start_date"] = start.UTC().Format(time.RFC3339)
 	}
 	if endDate != "" {
-		base += " AND DATE_STR(timestamp) <= $end_date"
-		named["end_date"] = endDate
+		end, err := time.Parse("2006-01-02", endDate)
+		if err != nil {
+			return nil, fmt.Errorf("invalid end_date: %w", err)
+		}
+
+		base += " AND STR_TO_MILLIS(timestamp) < STR_TO_MILLIS($end_date)"
+		named["end_date"] = end.AddDate(0, 0, 1).UTC().Format(time.RFC3339)
 	}
 
 	statement := base + " ORDER BY timestamp DESC LIMIT $limit OFFSET $offset"
