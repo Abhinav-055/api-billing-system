@@ -7,6 +7,7 @@ import type { ApiKey } from "@/lib/types";
 export default function KeysPage() {
   const [keys, setKeys] = useState<ApiKey[]>([]);
   const [newKey, setNewKey] = useState<string>("");
+  const [copyState, setCopyState] = useState<string>("");
   const [error, setError] = useState<string>("");
 
   const loadKeys = useCallback(() => {
@@ -39,6 +40,19 @@ export default function KeysPage() {
     }
   };
 
+  const copyNewKey = async () => {
+    if (!newKey) {
+      return;
+    }
+
+    try {
+      await navigator.clipboard.writeText(newKey);
+      setCopyState("Copied");
+    } catch {
+      setCopyState("Copy failed");
+    }
+  };
+
   return (
     <div className="space-y-4">
       <section className="card p-5">
@@ -53,7 +67,22 @@ export default function KeysPage() {
           </button>
         </div>
         {newKey ? (
-          <p className="mt-3 rounded-xl bg-accent/10 p-3 text-sm text-accent">Copy now: {newKey}</p>
+          <div className="mt-3 rounded-xl border border-accent/40 bg-accent/10 p-3">
+            <p className="mb-2 text-xs font-semibold uppercase tracking-[0.12em] text-accent">New API Key</p>
+            <div className="flex flex-col gap-2 md:flex-row md:items-center">
+              <div className="min-w-0 flex-1 rounded-lg border border-muted/40 bg-panel px-3 py-2 font-mono text-sm text-ink">
+                {newKey}
+              </div>
+              <button
+                type="button"
+                onClick={copyNewKey}
+                className="rounded-lg border border-accent/40 bg-accent px-3 py-2 text-sm font-semibold text-white"
+              >
+                Copy
+              </button>
+            </div>
+            {copyState ? <p className="mt-2 text-xs text-accent">{copyState}</p> : null}
+          </div>
         ) : null}
         {error ? <p className="mt-2 text-sm text-signal">{error}</p> : null}
       </section>
