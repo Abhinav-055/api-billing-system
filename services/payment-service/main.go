@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"math"
 	"net/http"
 	"os"
 	"runtime/debug"
@@ -37,6 +36,8 @@ const (
 	couchbaseCallTimeout = 10 * time.Second
 	grpcCallTimeout      = 5 * time.Second
 )
+
+var errInvalidOrderAmount = errors.New("order amount must be positive whole-rupee paise")
 
 type contextKey string
 
@@ -75,26 +76,74 @@ type orderDoc struct {
 
 func decodeOrderResult(result *gocb.GetResult) (orderDoc, error) {
 	var order orderDoc
-	if err := result.Content(&order); err == nil {
-		return order, nil
-	}
-	var raw map[string]any
-	if err := result.Content(&raw); err != nil {
+	if err := result.Content(&order); err != nil {
 		return orderDoc{}, err
 	}
-	order.OrderID, _ = raw["order_id"].(string)
-	order.UserID, _ = raw["user_id"].(string)
-	order.Currency, _ = raw["currency"].(string)
-	order.Status, _ = raw["status"].(string)
-	if value, ok := raw["amount_minor"].(float64); ok {
-		order.AmountMinor = int64(math.Round(value))
-	} else if value, ok := raw["amount"].(float64); ok {
-		order.AmountMinor = int64(math.Round(value * 100))
+	if order.AmountMinor == 0 {
+		var raw map[string]json.RawMessage
+		if err := result.Content(&raw); err != nil {
+			return orderDoc{}, err
+		}
+		if amountMinor, ok := raw["amount_minor"]; ok {
+			if err := json.Unmarshal(amountMinor, &order.AmountMinor); err != nil {
+				return orderDoc{}, fmt.Errorf("decode amount_minor: %w", err)
+			}
+		} else if amount, ok := raw["amount"]; ok {
+			amountMinor, err := rupeesJSONToPaise(amount)
+			if err != nil {
+				return orderDoc{}, err
+			}
+			order.AmountMinor = amountMinor
+		}
 	}
 	if order.Currency == "" {
 		order.Currency = "INR"
 	}
 	return order, nil
+}
+
+func creditsFromPaise(amountPaise int64) (int64, error) {
+	if amountPaise <= 0 || amountPaise%100 != 0 {
+		return 0, errInvalidOrderAmount
+	}
+	return amountPaise / 100, nil
+}
+
+func rupeesJSONToPaise(raw json.RawMessage) (int64, error) {
+	var amount json.Number
+	decoder := json.NewDecoder(strings.NewReader(string(raw)))
+	decoder.UseNumber()
+	if err := decoder.Decode(&amount); err != nil {
+		return 0, fmt.Errorf("decode legacy rupee amount: %w", err)
+	}
+	value := amount.String()
+	if strings.HasPrefix(value, "-") || strings.HasPrefix(value, "+") {
+		return 0, errInvalidOrderAmount
+	}
+	parts := strings.Split(value, ".")
+	if len(parts) > 2 || parts[0] == "" {
+		return 0, errInvalidOrderAmount
+	}
+	rupees, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return 0, errInvalidOrderAmount
+	}
+	fraction := "00"
+	if len(parts) == 2 {
+		if len(parts[1]) > 2 || parts[1] == "" {
+			return 0, errInvalidOrderAmount
+		}
+		fraction = parts[1] + strings.Repeat("0", 2-len(parts[1]))
+	}
+	paise, err := strconv.ParseInt(fraction, 10, 64)
+	if err != nil || rupees > (int64(^uint64(0)>>1)-paise)/100 {
+		return 0, errInvalidOrderAmount
+	}
+	amountPaise := rupees*100 + paise
+	if _, err := creditsFromPaise(amountPaise); err != nil {
+		return 0, err
+	}
+	return amountPaise, nil
 }
 
 type service struct {
@@ -333,14 +382,20 @@ func (s *service) handleCreateOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	amountMinor := req.AmountMinor
+	if req.Amount < 0 {
+		writeJSONError(w, http.StatusBadRequest, "INVALID_REQUEST", "amount out of range")
+		return
+	}
 	if amountMinor == 0 {
-		if req.Amount <= 0 || req.Amount > s.cfg.MaxAmountMinor/100 {
+		if req.Amount <= 0 || s.cfg.MaxAmountMinor <= 0 || req.Amount > s.cfg.MaxAmountMinor/100 {
 			writeJSONError(w, http.StatusBadRequest, "INVALID_REQUEST", "amount out of range")
 			return
 		}
 		amountMinor = req.Amount * 100
 	}
-	if amountMinor < s.cfg.MinAmountMinor || amountMinor > s.cfg.MaxAmountMinor {
+	if _, err := creditsFromPaise(amountMinor); err != nil ||
+		s.cfg.MinAmountMinor <= 0 || s.cfg.MaxAmountMinor < s.cfg.MinAmountMinor ||
+		amountMinor < s.cfg.MinAmountMinor || amountMinor > s.cfg.MaxAmountMinor {
 		writeJSONError(w, http.StatusBadRequest, "INVALID_REQUEST", "amount out of range")
 		return
 	}
@@ -425,6 +480,16 @@ func (s *service) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ignored"})
 		return
 	}
+	entity := payload.Payload.Payment.Entity
+	if _, err := creditsFromPaise(entity.Amount); err != nil {
+		s.logger.Error("payment webhook amount is not whole-rupee paise",
+			slog.String("event_type", "PAYMENT_AMOUNT_VALIDATION"),
+			slog.String("order_id", orderID),
+			slog.String("payment_id", paymentID),
+			slog.Int64("amount_paise", entity.Amount))
+		writeJSONError(w, http.StatusBadRequest, "INVALID_AMOUNT", "payment amount must be positive whole-rupee paise")
+		return
+	}
 
 	orderCtx, orderCancel := context.WithTimeout(r.Context(), couchbaseCallTimeout)
 	defer orderCancel()
@@ -442,7 +507,6 @@ func (s *service) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusInternalServerError, "COUCHBASE_ERROR", "failed to decode order")
 		return
 	}
-	entity := payload.Payload.Payment.Entity
 	if entity.Amount != order.AmountMinor || entity.Currency != order.Currency {
 		s.logger.Error("payment webhook amount/currency mismatch",
 			slog.String("order_id", orderID),
@@ -465,6 +529,8 @@ func (s *service) handleWebhook(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusBadGateway, "WALLET_ERROR", "failed to credit wallet")
 		case strings.HasPrefix(err.Error(), "nats:"):
 			writeJSONError(w, http.StatusBadGateway, "NATS_ERROR", "failed to publish payment success")
+		case errors.Is(err, errInvalidOrderAmount):
+			writeJSONError(w, http.StatusBadRequest, "INVALID_AMOUNT", "order amount must be positive whole-rupee paise")
 		default:
 			writeJSONError(w, http.StatusInternalServerError, "COUCHBASE_ERROR", "failed to process payment")
 		}
@@ -510,6 +576,8 @@ func (s *service) handleConfirmPayment(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusBadGateway, "WALLET_ERROR", "failed to credit wallet")
 		case strings.HasPrefix(err.Error(), "nats:"):
 			writeJSONError(w, http.StatusBadGateway, "NATS_ERROR", "failed to publish payment success")
+		case errors.Is(err, errInvalidOrderAmount):
+			writeJSONError(w, http.StatusBadRequest, "INVALID_AMOUNT", "order amount must be positive whole-rupee paise")
 		default:
 			writeJSONError(w, http.StatusInternalServerError, "COUCHBASE_ERROR", "failed to process payment")
 		}
@@ -530,6 +598,14 @@ func (s *service) processCapturedPayment(reqCtx context.Context, orderID, paymen
 	order, err := decodeOrderResult(orderResult)
 	if err != nil {
 		return err
+	}
+	creditUnits, err := creditsFromPaise(order.AmountMinor)
+	if err != nil {
+		s.logger.Error("stored payment order amount is not whole-rupee paise",
+			slog.String("event_type", "PAYMENT_AMOUNT_VALIDATION"),
+			slog.String("order_id", orderID),
+			slog.Int64("amount_paise", order.AmountMinor))
+		return errInvalidOrderAmount
 	}
 	if order.Status == "completed" {
 		return nil
@@ -558,10 +634,6 @@ func (s *service) processCapturedPayment(reqCtx context.Context, orderID, paymen
 	}
 	grpcCtx, grpcCancel := context.WithTimeout(context.Background(), grpcCallTimeout)
 	defer grpcCancel()
-	creditUnits := order.AmountMinor / 100
-	if creditUnits <= 0 {
-		return fmt.Errorf("wallet: invalid credit amount")
-	}
 	creditResp, err := s.walletClient.CreditBalance(grpcCtx, &walletpb.CreditRequest{
 		UserId:         order.UserID,
 		AmountMinor:    creditUnits,
