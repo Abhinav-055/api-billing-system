@@ -20,9 +20,17 @@ func TestHashAPIKeyDeterministic(t *testing.T) {
 	if h1 != h2 {
 		t.Fatal("hashAPIKey should be deterministic")
 	}
-
 	h3 := hashAPIKey("salt2", "key")
 	if h1 == h3 {
 		t.Fatal("hashAPIKey should change with salt")
+	}
+}
+
+func TestRouteCost(t *testing.T) {
+	if got := routeCost("/api/v1/data"); got != 1 {
+		t.Fatalf("data cost = %d, want 1", got)
+	}
+	if got := routeCost("/api/v1/compute"); got != 3 {
+		t.Fatalf("compute cost = %d, want 3", got)
 	}
 }

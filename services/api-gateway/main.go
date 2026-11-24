@@ -18,7 +18,9 @@ import (
 	"strings"
 	"time"
 
+	sharedconfig "github.com/apibilling/platform/pkg/config"
 	"github.com/apibilling/platform/pkg/events"
+	"github.com/apibilling/platform/pkg/grpcauth"
 	walletpb "github.com/apibilling/platform/proto/wallet"
 	"github.com/couchbase/gocb/v2"
 	"github.com/go-chi/chi/v5"
@@ -43,8 +45,9 @@ const (
 type contextKey string
 
 const (
-	ctxRequestID contextKey = "request_id"
-	ctxUserID    contextKey = "user_id"
+	ctxRequestID     contextKey = "request_id"
+	ctxUserID        contextKey = "user_id"
+	ctxReservationID contextKey = "reservation_id"
 )
 
 type config struct {
@@ -59,6 +62,7 @@ type config struct {
 	CouchbaseBucket    string
 	WalletGRPCAddr     string
 	InternalServerAddr string
+	GRPCSecret         string
 }
 
 type app struct {
@@ -128,6 +132,15 @@ func (r *responseRecorder) WriteHeader(code int) {
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	cfg := loadConfig()
+	if err := sharedconfig.RequireSecrets(logger, map[string]string{
+		"JWT_SECRET":         cfg.JWTSecret,
+		"API_KEY_SALT":       cfg.APIKeySalt,
+		"COUCHBASE_PASSWORD": cfg.CouchbasePassword,
+		"GRPC_SHARED_SECRET": cfg.GRPCSecret,
+	}); err != nil {
+		logger.Error("startup secret validation failed", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
 
 	application, err := newApp(cfg, logger)
 	if err != nil {
@@ -158,7 +171,7 @@ func main() {
 
 		protected.Group(func(metered chi.Router) {
 			metered.Use(application.rateLimitMiddleware)
-			metered.Use(application.balanceCheckMiddleware)
+			metered.Use(application.reservationMiddleware)
 			metered.Use(application.usageLogMiddleware)
 
 			metered.Get("/api/v1/data", application.handleData)
@@ -196,6 +209,7 @@ func loadConfig() config {
 		CouchbaseBucket:    getEnv("COUCHBASE_BUCKET", "apibilling"),
 		WalletGRPCAddr:     "wallet-service:" + grpcPort,
 		InternalServerAddr: "localhost:" + grpcPort,
+		GRPCSecret:         getEnv("GRPC_SHARED_SECRET", "dev-grpc-secret"),
 	}
 }
 
@@ -233,7 +247,10 @@ func newApp(cfg config, logger *slog.Logger) (*app, error) {
 		walletAddr = cfg.InternalServerAddr
 	}
 
-	walletConn, err := grpc.NewClient(walletAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	walletConn, err := grpc.NewClient(walletAddr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithUnaryInterceptor(grpcauth.UnaryClientInterceptor(cfg.GRPCSecret)),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("connect wallet grpc: %w", err)
 	}
@@ -454,23 +471,56 @@ return {1, 0}
 	})
 }
 
-func (a *app) balanceCheckMiddleware(next http.Handler) http.Handler {
+func routeCost(path string) int64 {
+	switch strings.TrimSpace(path) {
+	case "/api/v1/data":
+		return 1
+	case "/api/v1/compute":
+		return 3
+	default:
+		return 2
+	}
+}
+
+func (a *app) reservationMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cost := routeCost(r.URL.Path)
+		reservationID := requestIDFromContext(r.Context())
 		ctx, cancel := context.WithTimeout(r.Context(), grpcCallTimeout)
-		defer cancel()
-
-		resp, err := a.walletClient.CheckBalance(ctx, &walletpb.BalanceRequest{UserId: userIDFromContext(r.Context())})
+		resp, err := a.walletClient.ReserveFunds(ctx, &walletpb.ReserveFundsRequest{
+			UserId:        userIDFromContext(r.Context()),
+			AmountMinor:   cost,
+			ReservationId: reservationID,
+			TtlSeconds:    int64((5 * time.Minute).Seconds()),
+			Currency:      "INR",
+		})
+		cancel()
 		if err != nil {
-			writeJSONError(w, http.StatusBadGateway, "WALLET_UNAVAILABLE", "wallet check failed")
+			writeJSONError(w, http.StatusServiceUnavailable, "WALLET_UNAVAILABLE", "wallet unavailable")
+			return
+		}
+		if !resp.GetReserved() {
+			if resp.GetReason() == "INSUFFICIENT_FUNDS" {
+				writeJSONError(w, http.StatusPaymentRequired, "INSUFFICIENT_FUNDS", "insufficient wallet balance")
+				return
+			}
+			writeJSONError(w, http.StatusConflict, "RESERVATION_FAILED", resp.GetReason())
 			return
 		}
 
-		if !resp.GetHasSufficientFunds() {
-			writeJSONError(w, http.StatusPaymentRequired, "INSUFFICIENT_FUNDS", "insufficient wallet balance")
-			return
+		r = r.WithContext(context.WithValue(r.Context(), ctxReservationID, reservationID))
+		rec := &responseRecorder{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(rec, r)
+		if rec.status >= 500 {
+			releaseCtx, releaseCancel := context.WithTimeout(context.Background(), time.Second)
+			_, releaseErr := a.walletClient.ReleaseReservation(releaseCtx, &walletpb.ReleaseReservationRequest{ReservationId: reservationID})
+			releaseCancel()
+			if releaseErr != nil {
+				a.logger.Error("failed to release reservation; sweeper will reconcile",
+					slog.String("reservation_id", reservationID),
+					slog.String("error", releaseErr.Error()))
+			}
 		}
-
-		next.ServeHTTP(w, r)
 	})
 }
 
@@ -485,13 +535,16 @@ func (a *app) usageLogMiddleware(next http.Handler) http.Handler {
 		}
 
 		event := events.UsageEvent{
-			UserID:     userIDFromContext(r.Context()),
-			Endpoint:   r.URL.Path,
-			Method:     r.Method,
-			StatusCode: rec.status,
-			LatencyMs:  time.Since(start).Milliseconds(),
-			RequestID:  requestIDFromContext(r.Context()),
-			Timestamp:  time.Now().UTC(),
+			UserID:        userIDFromContext(r.Context()),
+			Endpoint:      r.URL.Path,
+			Method:        r.Method,
+			CostMinor:     routeCost(r.URL.Path),
+			Currency:      "INR",
+			StatusCode:    rec.status,
+			LatencyMs:     time.Since(start).Milliseconds(),
+			RequestID:     requestIDFromContext(r.Context()),
+			ReservationID: requestIDFromContext(r.Context()),
+			Timestamp:     time.Now().UTC(),
 		}
 
 		if err := a.publisher.PublishUsage(r.Context(), event); err != nil {

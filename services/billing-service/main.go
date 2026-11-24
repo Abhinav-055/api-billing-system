@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	sharedconfig "github.com/apibilling/platform/pkg/config"
 	"github.com/apibilling/platform/pkg/events"
 	"github.com/couchbase/gocb/v2"
 	"github.com/nats-io/nats.go/jetstream"
@@ -28,6 +29,7 @@ type config struct {
 	CouchbaseUsername string
 	CouchbasePassword string
 	CouchbaseBucket   string
+	GRPCSecret        string
 }
 
 type usageLogDocument struct {
@@ -53,6 +55,13 @@ type service struct {
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	cfg := loadConfig()
+	if err := sharedconfig.RequireSecrets(logger, map[string]string{
+		"COUCHBASE_PASSWORD": cfg.CouchbasePassword,
+		"GRPC_SHARED_SECRET": cfg.GRPCSecret,
+	}); err != nil {
+		logger.Error("startup secret validation failed", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
 
 	svc, err := newService(cfg, logger)
 	if err != nil {
@@ -76,6 +85,7 @@ func loadConfig() config {
 		CouchbaseUsername: getEnv("COUCHBASE_USERNAME", "Administrator"),
 		CouchbasePassword: getEnv("COUCHBASE_PASSWORD", "password"),
 		CouchbaseBucket:   getEnv("COUCHBASE_BUCKET", "apibilling"),
+		GRPCSecret:        getEnv("GRPC_SHARED_SECRET", "dev-grpc-secret"),
 	}
 }
 
@@ -169,18 +179,18 @@ func (s *service) handleUsageMessage(msg jetstream.Msg) error {
 		return err
 	}
 
-	deductEvent := events.WalletDeductEvent{
-		UserID:         event.UserID,
-		Amount:         float64(cost),
-		IdempotencyKey: "usage:" + event.RequestID,
-		RequestID:      event.RequestID,
-		Timestamp:      time.Now().UTC(),
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := s.publisher.PublishWalletDeduct(ctx, deductEvent); err != nil {
-		return fmt.Errorf("publish wallet deduct event: %w", err)
+	captureEvent := events.WalletCaptureEvent{
+		UserID:         event.UserID,
+		ReservationID:  event.RequestID,
+		ActualAmount:   int64(cost),
+		Currency:       "INR",
+		IdempotencyKey: "usage:" + event.RequestID,
+		Timestamp:      time.Now().UTC(),
+	}
+	if err := s.publisher.PublishWalletCapture(ctx, captureEvent); err != nil {
+		return fmt.Errorf("publish wallet capture event: %w", err)
 	}
 
 	return nil
