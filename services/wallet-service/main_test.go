@@ -247,6 +247,50 @@ func TestReservationCallsAreIdempotentIntegration(t *testing.T) {
 	}
 }
 
+func TestSweeperReleasesAbandonedReservationIntegration(t *testing.T) {
+	svc, userID, trackHold := integrationWallet(t, 3)
+	reservationID := uuid.NewString()
+	trackHold(reservationID)
+	response, err := svc.ReserveFunds(context.Background(), &walletpb.ReserveFundsRequest{
+		UserId: userID, AmountMinor: 3, ReservationId: reservationID, TtlSeconds: 1, Currency: "INR",
+	})
+	if err != nil || !response.GetReserved() {
+		t.Fatalf("reserve abandoned hold: response=%v err=%v", response, err)
+	}
+	time.Sleep(1100 * time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var hold holdDoc
+	for {
+		sweepHeld(ctx, svc)
+		holdResult, err := svc.collection.Get("hold:::"+reservationID, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := holdResult.Content(&hold); err != nil {
+			t.Fatal(err)
+		}
+		if hold.Status == "RELEASED" {
+			break
+		}
+		if ctx.Err() != nil {
+			t.Fatalf("expired hold did not sweep before deadline: status=%s", hold.Status)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	walletResult, err := svc.collection.Get("wallet:::"+userID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wallet walletDoc
+	if err := walletResult.Content(&wallet); err != nil {
+		t.Fatal(err)
+	}
+	if hold.Status != "RELEASED" || wallet.Available != 3 || wallet.Held != 0 {
+		t.Fatalf("sweeper final hold=%s available=%d held=%d", hold.Status, wallet.Available, wallet.Held)
+	}
+}
+
 func TestMutationFailureBoundariesRecoverExactlyOnceIntegration(t *testing.T) {
 	steps := []string{
 		"after_idempotency_insert",
