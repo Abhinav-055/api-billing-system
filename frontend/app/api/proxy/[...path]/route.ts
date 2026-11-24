@@ -12,7 +12,16 @@ function resolveBackend(targetPath: string): string {
   return backend;
 }
 
-async function forward(request: NextRequest, method: "GET" | "POST" | "DELETE") {
+async function forward(request: NextRequest, method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE") {
+  if (method !== "GET") {
+    const origin = request.headers.get("origin");
+    const referer = request.headers.get("referer");
+    const allowedOrigin = request.nextUrl.origin;
+    const source = origin ?? (referer ? new URL(referer).origin : "");
+    if (request.headers.get("x-requested-with") !== "XMLHttpRequest" || source !== allowedOrigin) {
+      return NextResponse.json({ error: "csrf validation failed" }, { status: 403 });
+    }
+  }
   const token = cookies().get("jwt")?.value;
   if (!token) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
@@ -22,7 +31,7 @@ async function forward(request: NextRequest, method: "GET" | "POST" | "DELETE") 
   const upstream = resolveBackend(targetPath);
   const target = `${upstream}${targetPath}${request.nextUrl.search}`;
   let body: unknown;
-  if (method === "POST") {
+  if (method === "POST" || method === "PUT" || method === "PATCH") {
     try {
       body = await request.json();
     } catch {
@@ -60,4 +69,12 @@ export async function POST(request: NextRequest) {
 
 export async function DELETE(request: NextRequest) {
   return forward(request, "DELETE");
+}
+
+export async function PUT(request: NextRequest) {
+  return forward(request, "PUT");
+}
+
+export async function PATCH(request: NextRequest) {
+  return forward(request, "PATCH");
 }

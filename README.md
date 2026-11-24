@@ -10,6 +10,7 @@ The platform gives you:
 5. Razorpay payment order creation and payment confirmation flow
 6. Couchbase persistence for users, keys, usage, orders, and transactions
 7. Frontend control plane for dashboard, wallet, keys, and logs
+8. Cost-aware two-phase wallet reservations and durable idempotency
 
 ## Project Overview
 
@@ -122,6 +123,17 @@ Required for payments:
 Required secrets:
 1. JWT_SECRET
 2. API_KEY_SALT
+3. RAZORPAY_KEY_ID
+4. RAZORPAY_KEY_SECRET
+5. RAZORPAY_WEBHOOK_SECRET
+6. COUCHBASE_PASSWORD
+7. GRPC_SHARED_SECRET
+
+Environment defaults and limits:
+1. `ENV=local` for Docker development; production startup fails closed on missing or known dev secrets.
+2. `MIN_ORDER_AMOUNT_MINOR=100`, `MAX_ORDER_AMOUNT_MINOR=10000000`
+3. `HOLD_TTL=5m`, `SWEEP_INTERVAL=1m`
+4. `PAYMENT_PROCESSING_TIMEOUT=60s`
 
 Infra defaults (compose-ready):
 1. REDIS_URL=redis://redis:6379

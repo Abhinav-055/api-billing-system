@@ -4,6 +4,13 @@ import { NextResponse } from "next/server";
 const backend = process.env.BACKEND_URL ?? "http://localhost:8080";
 
 export async function POST(request: Request) {
+  const origin = request.headers.get("origin");
+  const referer = request.headers.get("referer");
+  const host = new URL(request.url).origin;
+  if (request.headers.get("x-requested-with") !== "XMLHttpRequest" ||
+      (origin ?? (referer ? new URL(referer).origin : "")) !== host) {
+    return NextResponse.json({ error: "csrf validation failed" }, { status: 403 });
+  }
   try {
     const payload = await request.json();
     const response = await axios.post(`${backend}/auth/login`, payload, { timeout: 10000 });
