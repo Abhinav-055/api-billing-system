@@ -8,14 +8,19 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"os"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"time"
 
+	sharedconfig "github.com/apibilling/platform/pkg/config"
 	"github.com/apibilling/platform/pkg/events"
+	"github.com/apibilling/platform/pkg/grpcauth"
 	walletpb "github.com/apibilling/platform/proto/wallet"
 	"github.com/couchbase/gocb/v2"
 	"github.com/go-chi/chi/v5"
@@ -50,6 +55,46 @@ type config struct {
 	CouchbaseUsername     string
 	CouchbasePassword     string
 	CouchbaseBucket       string
+	GRPCSecret            string
+	MinAmountMinor        int64
+	MaxAmountMinor        int64
+	ProcessingTimeout     time.Duration
+}
+
+type orderDoc struct {
+	OrderID             string    `json:"order_id"`
+	UserID              string    `json:"user_id"`
+	AmountMinor         int64     `json:"amount_minor"`
+	Currency            string    `json:"currency"`
+	Status              string    `json:"status"`
+	PaymentID           string    `json:"payment_id,omitempty"`
+	CreatedAt           time.Time `json:"created_at"`
+	ProcessingStartedAt time.Time `json:"processing_started_at,omitempty"`
+	CompletedAt         time.Time `json:"completed_at,omitempty"`
+}
+
+func decodeOrderResult(result *gocb.GetResult) (orderDoc, error) {
+	var order orderDoc
+	if err := result.Content(&order); err == nil {
+		return order, nil
+	}
+	var raw map[string]any
+	if err := result.Content(&raw); err != nil {
+		return orderDoc{}, err
+	}
+	order.OrderID, _ = raw["order_id"].(string)
+	order.UserID, _ = raw["user_id"].(string)
+	order.Currency, _ = raw["currency"].(string)
+	order.Status, _ = raw["status"].(string)
+	if value, ok := raw["amount_minor"].(float64); ok {
+		order.AmountMinor = int64(math.Round(value))
+	} else if value, ok := raw["amount"].(float64); ok {
+		order.AmountMinor = int64(math.Round(value * 100))
+	}
+	if order.Currency == "" {
+		order.Currency = "INR"
+	}
+	return order, nil
 }
 
 type service struct {
@@ -82,6 +127,17 @@ func (r *responseRecorder) WriteHeader(code int) {
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	cfg := loadConfig()
+	if err := sharedconfig.RequireSecrets(logger, map[string]string{
+		"JWT_SECRET":              cfg.JWTSecret,
+		"RAZORPAY_KEY_ID":         cfg.RazorpayKeyID,
+		"RAZORPAY_KEY_SECRET":     cfg.RazorpayKeySecret,
+		"RAZORPAY_WEBHOOK_SECRET": cfg.RazorpayWebhookSecret,
+		"COUCHBASE_PASSWORD":      cfg.CouchbasePassword,
+		"GRPC_SHARED_SECRET":      cfg.GRPCSecret,
+	}); err != nil {
+		logger.Error("startup secret validation failed", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
 
 	svc, err := newService(cfg, logger)
 	if err != nil {
@@ -170,6 +226,10 @@ func loadConfig() config {
 		CouchbaseUsername:     getEnv("COUCHBASE_USERNAME", "Administrator"),
 		CouchbasePassword:     getEnv("COUCHBASE_PASSWORD", "password"),
 		CouchbaseBucket:       getEnv("COUCHBASE_BUCKET", "apibilling"),
+		GRPCSecret:            getEnv("GRPC_SHARED_SECRET", "dev-grpc-secret"),
+		MinAmountMinor:        parseInt64Env("MIN_ORDER_AMOUNT_MINOR", 100),
+		MaxAmountMinor:        parseInt64Env("MAX_ORDER_AMOUNT_MINOR", 10000000),
+		ProcessingTimeout:     parseDurationEnv("PAYMENT_PROCESSING_TIMEOUT", 60*time.Second),
 	}
 }
 
@@ -201,7 +261,10 @@ func newService(cfg config, logger *slog.Logger) (*service, error) {
 		return nil, fmt.Errorf("wait bucket ready: %w", err)
 	}
 
-	walletConn, err := grpc.NewClient(cfg.WalletGRPCAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	walletConn, err := grpc.NewClient(cfg.WalletGRPCAddr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithUnaryInterceptor(grpcauth.UnaryClientInterceptor(cfg.GRPCSecret)),
+	)
 	if err != nil {
 		nc.Close()
 		cluster.Close(nil)
@@ -260,12 +323,25 @@ func (s *service) authMiddleware(next http.Handler) http.Handler {
 
 func (s *service) handleCreateOrder(w http.ResponseWriter, r *http.Request) {
 	type request struct {
-		Amount int `json:"amount"`
+		AmountMinor int64 `json:"amount_minor"`
+		Amount      int64 `json:"amount"`
 	}
 
 	var req request
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Amount <= 0 {
-		writeJSONError(w, http.StatusBadRequest, "INVALID_REQUEST", "amount must be positive")
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid json body")
+		return
+	}
+	amountMinor := req.AmountMinor
+	if amountMinor == 0 {
+		if req.Amount <= 0 || req.Amount > s.cfg.MaxAmountMinor/100 {
+			writeJSONError(w, http.StatusBadRequest, "INVALID_REQUEST", "amount out of range")
+			return
+		}
+		amountMinor = req.Amount * 100
+	}
+	if amountMinor < s.cfg.MinAmountMinor || amountMinor > s.cfg.MaxAmountMinor {
+		writeJSONError(w, http.StatusBadRequest, "INVALID_REQUEST", "amount out of range")
 		return
 	}
 
@@ -276,7 +352,7 @@ func (s *service) handleCreateOrder(w http.ResponseWriter, r *http.Request) {
 	}
 	receipt := fmt.Sprintf("ord_%d_%s", time.Now().Unix(), userSuffix)
 	orderData := map[string]interface{}{
-		"amount":   req.Amount * 100,
+		"amount":   amountMinor,
 		"currency": "INR",
 		"receipt":  receipt,
 	}
@@ -296,56 +372,93 @@ func (s *service) handleCreateOrder(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), couchbaseCallTimeout)
 	defer cancel()
 
-	orderDoc := map[string]any{
-		"order_id":   orderID,
-		"user_id":    userID,
-		"amount":     req.Amount,
-		"currency":   "INR",
-		"status":     "pending",
-		"created_at": time.Now().UTC(),
+	order := orderDoc{
+		OrderID:     orderID,
+		UserID:      userID,
+		AmountMinor: amountMinor,
+		Currency:    "INR",
+		Status:      "pending",
+		CreatedAt:   time.Now().UTC(),
 	}
-	if _, err = s.collection.Upsert("order:::"+orderID, orderDoc, &gocb.UpsertOptions{Context: ctx}); err != nil {
+	if _, err = s.collection.Insert("order:::"+orderID, order, &gocb.InsertOptions{Context: ctx}); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "COUCHBASE_ERROR", "failed to store order")
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{"order_id": orderID, "amount": req.Amount, "currency": "INR", "key_id": s.cfg.RazorpayKeyID})
+	writeJSON(w, http.StatusOK, map[string]any{"order_id": orderID, "amount": amountMinor, "amount_minor": amountMinor, "currency": "INR", "key_id": s.cfg.RazorpayKeyID})
 }
 
 func (s *service) handleWebhook(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	rawBody, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid webhook payload")
+		return
+	}
+	signature := r.Header.Get("X-Razorpay-Signature")
+	if !verifyWebhookSignature(rawBody, signature, s.cfg.RazorpayWebhookSecret) {
+		writeJSONError(w, http.StatusUnauthorized, "INVALID_SIGNATURE", "signature verification failed")
+		return
+	}
 	var payload struct {
 		Event   string `json:"event"`
 		Payload struct {
 			Payment struct {
 				Entity struct {
-					ID      string `json:"id"`
-					OrderID string `json:"order_id"`
-					Amount  int    `json:"amount"`
+					ID       string `json:"id"`
+					OrderID  string `json:"order_id"`
+					Amount   int64  `json:"amount"`
+					Currency string `json:"currency"`
 				} `json:"entity"`
 			} `json:"payment"`
 		} `json:"payload"`
 	}
 
-	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+	if err := json.Unmarshal(rawBody, &payload); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid webhook payload")
 		return
 	}
 
 	orderID := payload.Payload.Payment.Entity.OrderID
 	paymentID := payload.Payload.Payment.Entity.ID
-	signature := r.Header.Get("X-Razorpay-Signature")
-	if !verifyRazorpaySignature(orderID, paymentID, signature, s.cfg.RazorpayWebhookSecret) {
-		writeJSONError(w, http.StatusBadRequest, "INVALID_SIGNATURE", "signature verification failed")
-		return
-	}
-
 	if payload.Event != "payment.captured" {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ignored"})
 		return
 	}
 
+	orderCtx, orderCancel := context.WithTimeout(r.Context(), couchbaseCallTimeout)
+	defer orderCancel()
+	orderRes, err := s.collection.Get("order:::"+orderID, &gocb.GetOptions{Context: orderCtx})
+	if errors.Is(err, gocb.ErrDocumentNotFound) {
+		writeJSONError(w, http.StatusBadRequest, "ORDER_NOT_FOUND", "order not found")
+		return
+	}
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "COUCHBASE_ERROR", "failed to load order")
+		return
+	}
+	order, err := decodeOrderResult(orderRes)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "COUCHBASE_ERROR", "failed to decode order")
+		return
+	}
+	entity := payload.Payload.Payment.Entity
+	if entity.Amount != order.AmountMinor || entity.Currency != order.Currency {
+		s.logger.Error("payment webhook amount/currency mismatch",
+			slog.String("order_id", orderID),
+			slog.String("payment_id", paymentID),
+			slog.Int64("captured_amount", entity.Amount),
+			slog.Int64("order_amount", order.AmountMinor),
+			slog.String("captured_currency", entity.Currency),
+			slog.String("order_currency", order.Currency))
+		writeJSONError(w, http.StatusBadRequest, "PAYMENT_MISMATCH", "captured amount or currency mismatch")
+		return
+	}
+
 	if err := s.processCapturedPayment(r.Context(), orderID, paymentID); err != nil {
 		switch {
+		case strings.Contains(err.Error(), "PAYMENT_PROCESSING_CONFLICT"):
+			writeJSONError(w, http.StatusConflict, "PAYMENT_PROCESSING", "payment is already being processed")
 		case errors.Is(err, gocb.ErrDocumentNotFound):
 			writeJSONError(w, http.StatusNotFound, "ORDER_NOT_FOUND", "order not found")
 		case strings.HasPrefix(err.Error(), "wallet:"):
@@ -389,6 +502,8 @@ func (s *service) handleConfirmPayment(w http.ResponseWriter, r *http.Request) {
 
 	if err := s.processCapturedPayment(r.Context(), req.RazorpayOrderID, req.RazorpayPaymentID); err != nil {
 		switch {
+		case strings.Contains(err.Error(), "PAYMENT_PROCESSING_CONFLICT"):
+			writeJSONError(w, http.StatusConflict, "PAYMENT_PROCESSING", "payment is already being processed")
 		case errors.Is(err, gocb.ErrDocumentNotFound):
 			writeJSONError(w, http.StatusNotFound, "ORDER_NOT_FOUND", "order not found")
 		case strings.HasPrefix(err.Error(), "wallet:"):
@@ -405,39 +520,52 @@ func (s *service) handleConfirmPayment(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *service) processCapturedPayment(reqCtx context.Context, orderID, paymentID string) error {
-
 	ctx, cancel := context.WithTimeout(reqCtx, couchbaseCallTimeout)
 	defer cancel()
-
-	orderResult, err := s.collection.Get("order:::"+orderID, &gocb.GetOptions{Context: ctx})
+	key := "order:::" + orderID
+	orderResult, err := s.collection.Get(key, &gocb.GetOptions{Context: ctx})
 	if err != nil {
 		return err
 	}
-
-	var orderDoc map[string]any
-	if err = orderResult.Content(&orderDoc); err != nil {
+	order, err := decodeOrderResult(orderResult)
+	if err != nil {
 		return err
 	}
-
-	userID, _ := orderDoc["user_id"].(string)
-	amountFloat, _ := orderDoc["amount"].(float64)
-	amount := amountFloat
-	if status, _ := orderDoc["status"].(string); status == "completed" {
+	if order.Status == "completed" {
 		return nil
 	}
-
-	orderDoc["status"] = "completed"
-	orderDoc["payment_id"] = paymentID
-	orderDoc["completed_at"] = time.Now().UTC()
-	if _, err = s.collection.Upsert("order:::"+orderID, orderDoc, &gocb.UpsertOptions{Context: ctx}); err != nil {
-		return err
+	if order.Currency == "" {
+		order.Currency = "INR"
 	}
-
+	if order.Status == "processing" {
+		stale := !order.ProcessingStartedAt.IsZero() && time.Since(order.ProcessingStartedAt) > s.cfg.ProcessingTimeout
+		samePayment := order.PaymentID == paymentID
+		if !stale && !samePayment {
+			return fmt.Errorf("PAYMENT_PROCESSING_CONFLICT")
+		}
+	} else if order.Status == "pending" {
+		order.Status = "processing"
+		order.PaymentID = paymentID
+		order.ProcessingStartedAt = time.Now().UTC()
+		if _, err = s.collection.Replace(key, order, &gocb.ReplaceOptions{Cas: orderResult.Cas(), Context: ctx}); err != nil {
+			if errors.Is(err, gocb.ErrCasMismatch) {
+				return fmt.Errorf("PAYMENT_PROCESSING_CONFLICT")
+			}
+			return err
+		}
+	} else {
+		return fmt.Errorf("invalid order state %s", order.Status)
+	}
 	grpcCtx, grpcCancel := context.WithTimeout(context.Background(), grpcCallTimeout)
 	defer grpcCancel()
+	creditUnits := order.AmountMinor / 100
+	if creditUnits <= 0 {
+		return fmt.Errorf("wallet: invalid credit amount")
+	}
 	creditResp, err := s.walletClient.CreditBalance(grpcCtx, &walletpb.CreditRequest{
-		UserId:         userID,
-		Amount:         amount,
+		UserId:         order.UserID,
+		AmountMinor:    creditUnits,
+		Currency:       order.Currency,
 		IdempotencyKey: "payment:" + paymentID,
 	})
 	if err != nil || !creditResp.GetSuccess() {
@@ -446,10 +574,22 @@ func (s *service) processCapturedPayment(reqCtx context.Context, orderID, paymen
 		}
 		return fmt.Errorf("wallet: credit response unsuccessful")
 	}
-
+	current, err := s.collection.Get(key, &gocb.GetOptions{Context: ctx})
+	if err != nil {
+		return err
+	}
+	if err = current.Content(&order); err != nil {
+		return err
+	}
+	order.Status = "completed"
+	order.CompletedAt = time.Now().UTC()
+	if _, err = s.collection.Replace(key, order, &gocb.ReplaceOptions{Cas: current.Cas(), Context: ctx}); err != nil {
+		return err
+	}
 	evt := events.PaymentSuccessEvent{
-		UserID:            userID,
-		Amount:            amount,
+		UserID:            order.UserID,
+		AmountMinor:       order.AmountMinor,
+		Currency:          order.Currency,
 		RazorpayOrderID:   orderID,
 		RazorpayPaymentID: paymentID,
 		Timestamp:         time.Now().UTC(),
@@ -511,6 +651,19 @@ func verifyRazorpaySignature(orderID string, paymentID string, signature string,
 	return hmac.Equal([]byte(expected), []byte(signature))
 }
 
+func verifyWebhookSignature(rawBody []byte, signature, secret string) bool {
+	if strings.TrimSpace(signature) == "" || strings.TrimSpace(secret) == "" {
+		return false
+	}
+	provided, err := hex.DecodeString(strings.TrimSpace(signature))
+	if err != nil {
+		return false
+	}
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write(rawBody)
+	return hmac.Equal(mac.Sum(nil), provided)
+}
+
 func requestIDFromContext(ctx context.Context) string {
 	requestID, _ := ctx.Value(requestIDContextKey).(string)
 	return requestID
@@ -536,4 +689,28 @@ func getEnv(key string, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func parseInt64Env(key string, fallback int64) int64 {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || parsed < 0 {
+		return fallback
+	}
+	return parsed
+}
+
+func parseDurationEnv(key string, fallback time.Duration) time.Duration {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := time.ParseDuration(value)
+	if err != nil || parsed <= 0 {
+		return fallback
+	}
+	return parsed
 }
