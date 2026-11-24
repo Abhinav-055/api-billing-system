@@ -7,7 +7,7 @@ export async function POST() {
     value: "",
     httpOnly: true,
     sameSite: "lax",
-    secure: process.env.NODE_ENV === "production",
+    secure: (process.env.ENV ?? "production").toLowerCase() !== "local",
     path: "/",
     maxAge: 0
   });

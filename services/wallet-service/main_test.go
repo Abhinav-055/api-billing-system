@@ -11,13 +11,51 @@ import (
 	"time"
 
 	"github.com/apibilling/platform/pkg/events"
+	"github.com/apibilling/platform/pkg/grpcauth"
 	walletpb "github.com/apibilling/platform/proto/wallet"
 	"github.com/couchbase/gocb/v2"
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 )
+
+func TestWalletGRPCRejectsMissingAndWrongInternalTokenIntegration(t *testing.T) {
+	if os.Getenv("WALLET_COUCHBASE_INTEGRATION") != "1" {
+		t.Skip("set WALLET_COUCHBASE_INTEGRATION=1 to run service integration tests")
+	}
+	address := os.Getenv("WALLET_GRPC_ADDR")
+	if address == "" {
+		address = "wallet-service:9090"
+	}
+	for _, tc := range []struct {
+		name  string
+		token string
+	}{
+		{name: "missing token"},
+		{name: "wrong token", token: "untrusted-token"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			options := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
+			if tc.token != "" {
+				options = append(options, grpc.WithUnaryInterceptor(grpcauth.UnaryClientInterceptor(tc.token)))
+			}
+			conn, err := grpc.NewClient(address, options...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_, err = walletpb.NewWalletServiceClient(conn).CheckBalance(ctx, &walletpb.BalanceRequest{UserId: "external-client"})
+			if status.Code(err) != codes.Unauthenticated {
+				t.Fatalf("gRPC status=%s err=%v, want Unauthenticated", status.Code(err), err)
+			}
+		})
+	}
+}
 
 func integrationWallet(t *testing.T, available int64) (*server, string, func(string)) {
 	t.Helper()
