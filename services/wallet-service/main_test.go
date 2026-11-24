@@ -249,20 +249,24 @@ func TestReservationCallsAreIdempotentIntegration(t *testing.T) {
 
 func TestSweeperReleasesAbandonedReservationIntegration(t *testing.T) {
 	svc, userID, trackHold := integrationWallet(t, 3)
+	svc.cfg.CouchbaseBucket = os.Getenv("COUCHBASE_BUCKET")
+	svc.cfg.HoldTTL = time.Second
+	svc.cfg.SweepInterval = 100 * time.Millisecond
+	svc.logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	go svc.runSweeper(ctx)
+
 	reservationID := uuid.NewString()
 	trackHold(reservationID)
 	response, err := svc.ReserveFunds(context.Background(), &walletpb.ReserveFundsRequest{
-		UserId: userID, AmountMinor: 3, ReservationId: reservationID, TtlSeconds: 1, Currency: "INR",
+		UserId: userID, AmountMinor: 3, ReservationId: reservationID, Currency: "INR",
 	})
 	if err != nil || !response.GetReserved() {
 		t.Fatalf("reserve abandoned hold: response=%v err=%v", response, err)
 	}
-	time.Sleep(1100 * time.Millisecond)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
 	var hold holdDoc
 	for {
-		sweepHeld(ctx, svc)
 		holdResult, err := svc.collection.Get("hold:::"+reservationID, nil)
 		if err != nil {
 			t.Fatal(err)
@@ -276,7 +280,7 @@ func TestSweeperReleasesAbandonedReservationIntegration(t *testing.T) {
 		if ctx.Err() != nil {
 			t.Fatalf("expired hold did not sweep before deadline: status=%s", hold.Status)
 		}
-		time.Sleep(250 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond)
 	}
 	walletResult, err := svc.collection.Get("wallet:::"+userID, nil)
 	if err != nil {
@@ -288,6 +292,15 @@ func TestSweeperReleasesAbandonedReservationIntegration(t *testing.T) {
 	}
 	if hold.Status != "RELEASED" || wallet.Available != 3 || wallet.Held != 0 {
 		t.Fatalf("sweeper final hold=%s available=%d held=%d", hold.Status, wallet.Available, wallet.Held)
+	}
+}
+
+func TestLoadConfigHoldExpiryDurations(t *testing.T) {
+	t.Setenv("HOLD_TTL", "2s")
+	t.Setenv("SWEEP_INTERVAL", "250ms")
+	cfg := loadConfig(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if cfg.HoldTTL != 2*time.Second || cfg.SweepInterval != 250*time.Millisecond {
+		t.Fatalf("hold_ttl=%s sweep_interval=%s", cfg.HoldTTL, cfg.SweepInterval)
 	}
 }
 
