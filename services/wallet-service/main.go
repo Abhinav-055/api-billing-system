@@ -68,14 +68,21 @@ type walletDoc struct {
 }
 
 type txDoc struct {
-	TxID         string    `json:"tx_id"`
-	UserID       string    `json:"user_id"`
-	Type         string    `json:"type"`
-	AmountMinor  int64     `json:"amount_minor"`
-	BalanceAfter int64     `json:"balance_after"`
-	Reference    string    `json:"reference"`
-	Status       string    `json:"status"`
-	CreatedAt    time.Time `json:"created_at"`
+	TxID           string    `json:"tx_id"`
+	UserID         string    `json:"user_id"`
+	Type           string    `json:"type"`
+	AmountMinor    int64     `json:"amount_minor"`
+	BalanceAfter   int64     `json:"balance_after"`
+	IdempotencyKey string    `json:"idempotency_key,omitempty"`
+	Fingerprint    string    `json:"fingerprint,omitempty"`
+	Reference      string    `json:"reference"`
+	Status         string    `json:"status"`
+	CreatedAt      time.Time `json:"created_at"`
+}
+
+type idempotencyCacheEntry struct {
+	Fingerprint string           `json:"fingerprint"`
+	Result      idempotentResult `json:"result"`
 }
 
 type idempotencyDoc struct {
@@ -132,13 +139,14 @@ func (malformedWalletPayload) Error() string { return "MALFORMED_PAYLOAD" }
 
 type server struct {
 	walletpb.UnimplementedWalletServiceServer
-	cfg        configType
-	logger     *slog.Logger
-	redis      *redis.Client
-	cluster    *gocb.Cluster
-	collection *gocb.Collection
-	startedAt  time.Time
-	cancel     context.CancelFunc
+	cfg                 configType
+	logger              *slog.Logger
+	redis               *redis.Client
+	cluster             *gocb.Cluster
+	collection          *gocb.Collection
+	startedAt           time.Time
+	cancel              context.CancelFunc
+	mutationFailureHook func(string) error
 }
 
 // time.Now type alias is intentionally avoided at runtime; this field is initialized below.
@@ -359,9 +367,23 @@ func (s *server) durableIdempotency(ctx context.Context, key, fingerprint string
 	return &result, nil
 }
 
-func (s *server) cacheIdempotency(ctx context.Context, key string, result idempotentResult) {
-	body, _ := json.Marshal(result)
-	_ = s.redis.Set(ctx, "idempotent:"+key, body, 0).Err()
+func (s *server) cacheIdempotency(ctx context.Context, key, fingerprint string, result idempotentResult) {
+	body, err := json.Marshal(idempotencyCacheEntry{Fingerprint: fingerprint, Result: result})
+	if err != nil {
+		s.logger.Error("failed to encode idempotency cache entry", slog.String("error", err.Error()))
+		return
+	}
+	if err := s.redis.Set(ctx, "idempotent:"+key, body, 0).Err(); err != nil {
+		s.logger.Warn("idempotency cache write failed; durable record remains authoritative",
+			slog.String("key", key), slog.String("error", err.Error()))
+	}
+}
+
+func (s *server) mutationFailPoint(step string) error {
+	if s.mutationFailureHook != nil {
+		return s.mutationFailureHook(step)
+	}
+	return nil
 }
 
 func (s *server) mutation(ctx context.Context, userID string, delta int64, operation, idempotencyKey, reference, currency, fingerprint string) (*walletpb.DeductResponse, error) {
@@ -371,16 +393,23 @@ func (s *server) mutation(ctx context.Context, userID string, delta int64, opera
 
 	cbCtx, cancel := context.WithTimeout(ctx, couchbaseTimeout)
 	defer cancel()
-	if cached, err := s.redis.Get(cbCtx, "idempotent:"+idempotencyKey).Bytes(); err == nil {
-		var result idempotentResult
-		if json.Unmarshal(cached, &result) == nil {
-			return &walletpb.DeductResponse{Success: result.Success, NewBalance: result.NewBalance, Error: result.Error}, nil
+	if s.redis != nil {
+		if cached, err := s.redis.Get(cbCtx, "idempotent:"+idempotencyKey).Bytes(); err == nil {
+			var entry idempotencyCacheEntry
+			if json.Unmarshal(cached, &entry) == nil && entry.Fingerprint == fingerprint {
+				return &walletpb.DeductResponse{Success: entry.Result.Success, NewBalance: entry.Result.NewBalance, Error: entry.Result.Error}, nil
+			}
+			if json.Unmarshal(cached, &entry) == nil && entry.Fingerprint != "" && entry.Fingerprint != fingerprint {
+				return nil, status.Error(codes.InvalidArgument, "IDEMPOTENCY_KEY_CONFLICT")
+			}
 		}
 	}
-	if existing, err := s.durableIdempotency(cbCtx, idempotencyKey, fingerprint); err != nil {
+	existing, err := s.durableIdempotency(cbCtx, idempotencyKey, fingerprint)
+	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
-	} else if existing != nil {
-		s.cacheIdempotency(cbCtx, idempotencyKey, existing.Result)
+	}
+	if existing != nil && existing.Status == "completed" {
+		s.cacheIdempotency(cbCtx, idempotencyKey, fingerprint, existing.Result)
 		return &walletpb.DeductResponse{Success: existing.Result.Success, NewBalance: existing.Result.NewBalance, Error: existing.Result.Error}, nil
 	}
 
@@ -397,28 +426,112 @@ func (s *server) mutation(ctx context.Context, userID string, delta int64, opera
 	if err != nil {
 		return nil, err
 	}
+	unlock := func() {
+		if err := s.collection.Unlock(key, lockRes.Cas(), &gocb.UnlockOptions{Context: cbCtx}); err != nil {
+			s.logger.Warn("wallet unlock failed", slog.String("user_id", userID), slog.String("error", err.Error()))
+		}
+	}
 	var w walletDoc
 	if err := lockRes.Content(&w); err != nil {
+		unlock()
 		return nil, err
 	}
 	w.Available = legacyAvailable(w)
+	for _, tx := range w.Ledger {
+		if tx.IdempotencyKey != idempotencyKey {
+			continue
+		}
+		unlock()
+		if tx.Fingerprint != fingerprint {
+			return nil, status.Error(codes.InvalidArgument, "IDEMPOTENCY_KEY_CONFLICT")
+		}
+		result := idempotentResult{Success: true, NewBalance: tx.BalanceAfter}
+		if err := s.mutationFailPoint("before_ledger_write"); err != nil {
+			return nil, err
+		}
+		if _, err := s.collection.Insert("transaction:::"+tx.TxID, tx, &gocb.InsertOptions{Context: cbCtx}); err != nil && !errors.Is(err, gocb.ErrDocumentExists) {
+			return nil, fmt.Errorf("recover transaction ledger: %w", err)
+		}
+		if err := s.mutationFailPoint("after_ledger_write"); err != nil {
+			return nil, err
+		}
+		completed := idempotencyDoc{Key: idempotencyKey, Fingerprint: fingerprint, Status: "completed", Result: result, CreatedAt: time.Now().UTC()}
+		if _, err := s.collection.Upsert("idempotency:::"+idempotencyKey, completed, &gocb.UpsertOptions{Context: cbCtx}); err != nil {
+			return nil, fmt.Errorf("recover idempotency record: %w", err)
+		}
+		if err := s.mutationFailPoint("before_cache_write"); err != nil {
+			return nil, err
+		}
+		s.cacheIdempotency(cbCtx, idempotencyKey, fingerprint, result)
+		if err := s.mutationFailPoint("after_cache_write"); err != nil {
+			return nil, err
+		}
+		return &walletpb.DeductResponse{Success: true, NewBalance: result.NewBalance}, nil
+	}
+	for _, appliedKey := range w.AppliedKeys {
+		if appliedKey == idempotencyKey {
+			unlock()
+			return nil, status.Error(codes.FailedPrecondition, "IDEMPOTENCY_RECOVERY_INCOMPLETE")
+		}
+	}
 	if w.Currency == "" {
 		w.Currency = currency
 	}
 	if w.Currency != currency {
+		unlock()
 		return &walletpb.DeductResponse{Success: false, NewBalance: w.Available, Error: "CURRENCY_MISMATCH"}, nil
 	}
 	if operation == "debit" && w.Available < delta {
+		unlock()
 		return &walletpb.DeductResponse{Success: false, NewBalance: w.Available, Error: "INSUFFICIENT_FUNDS"}, nil
 	}
 	newBalance := w.Available + delta
 	if newBalance < 0 {
+		unlock()
 		return &walletpb.DeductResponse{Success: false, NewBalance: w.Available, Error: "INSUFFICIENT_FUNDS"}, nil
 	}
 
-	tx := txDoc{TxID: "tx_" + strings.ReplaceAll(uuid.NewString(), "-", ""), UserID: userID, Type: operation, AmountMinor: abs(delta), BalanceAfter: newBalance, Reference: reference, Status: "completed", CreatedAt: time.Now().UTC()}
+	if existing == nil {
+		pending := idempotencyDoc{Key: idempotencyKey, Fingerprint: fingerprint, Status: "processing", CreatedAt: time.Now().UTC()}
+		if _, err := s.collection.Insert("idempotency:::"+idempotencyKey, pending, &gocb.InsertOptions{Context: cbCtx}); err != nil {
+			if !errors.Is(err, gocb.ErrDocumentExists) {
+				unlock()
+				return nil, fmt.Errorf("insert idempotency guard: %w", err)
+			}
+			existing, err = s.durableIdempotency(cbCtx, idempotencyKey, fingerprint)
+			if err != nil {
+				unlock()
+				return nil, status.Error(codes.InvalidArgument, err.Error())
+			}
+			if existing == nil {
+				unlock()
+				return nil, fmt.Errorf("idempotency guard disappeared after conflict")
+			}
+			if existing.Status == "completed" {
+				unlock()
+				return &walletpb.DeductResponse{Success: existing.Result.Success, NewBalance: existing.Result.NewBalance, Error: existing.Result.Error}, nil
+			}
+		} else {
+			existing = &pending
+			if err := s.mutationFailPoint("after_idempotency_insert"); err != nil {
+				unlock()
+				return nil, err
+			}
+		}
+	} else if existing.Fingerprint != fingerprint {
+		unlock()
+		return nil, status.Error(codes.InvalidArgument, "IDEMPOTENCY_KEY_CONFLICT")
+	}
+
+	tx := txDoc{
+		TxID: "tx_" + strings.ReplaceAll(uuid.NewString(), "-", ""), UserID: userID,
+		Type: operation, AmountMinor: abs(delta), BalanceAfter: newBalance,
+		IdempotencyKey: idempotencyKey, Fingerprint: fingerprint,
+		Reference: reference, Status: "completed", CreatedAt: time.Now().UTC(),
+	}
 	w.Available = newBalance
 	w.Balance = 0
+	// The embedded ledger row makes a replaced wallet recoverable before projections finish.
 	w.Ledger = append(w.Ledger, tx)
 	if len(w.AppliedKeys) >= 100 {
 		w.AppliedKeys = w.AppliedKeys[len(w.AppliedKeys)-100:]
@@ -428,15 +541,30 @@ func (s *server) mutation(ctx context.Context, userID string, delta int64, opera
 	if _, err := s.collection.Replace(key, w, &gocb.ReplaceOptions{Cas: lockRes.Cas(), Context: cbCtx}); err != nil {
 		return nil, fmt.Errorf("CAS wallet mutation: %w", err)
 	}
-	// Permanent fallback guard and append-only ledger. No TTL.
-	idem := idempotencyDoc{Key: idempotencyKey, Fingerprint: fingerprint, Status: "completed", Result: idempotentResult{Success: true, NewBalance: newBalance}, CreatedAt: time.Now().UTC()}
-	if _, err := s.collection.Insert("idempotency:::"+idempotencyKey, idem, &gocb.InsertOptions{Context: cbCtx}); err != nil && !errors.Is(err, gocb.ErrDocumentExists) {
+	if err := s.mutationFailPoint("after_wallet_replace"); err != nil {
+		return nil, err
+	}
+	result := idempotentResult{Success: true, NewBalance: newBalance}
+	if err := s.mutationFailPoint("before_ledger_write"); err != nil {
 		return nil, err
 	}
 	if _, err := s.collection.Insert("transaction:::"+tx.TxID, tx, &gocb.InsertOptions{Context: cbCtx}); err != nil && !errors.Is(err, gocb.ErrDocumentExists) {
+		return nil, fmt.Errorf("write transaction ledger: %w", err)
+	}
+	if err := s.mutationFailPoint("after_ledger_write"); err != nil {
 		return nil, err
 	}
-	s.cacheIdempotency(cbCtx, idempotencyKey, idem.Result)
+	completed := idempotencyDoc{Key: idempotencyKey, Fingerprint: fingerprint, Status: "completed", Result: result, CreatedAt: time.Now().UTC()}
+	if _, err := s.collection.Upsert("idempotency:::"+idempotencyKey, completed, &gocb.UpsertOptions{Context: cbCtx}); err != nil {
+		return nil, fmt.Errorf("complete idempotency record: %w", err)
+	}
+	if err := s.mutationFailPoint("before_cache_write"); err != nil {
+		return nil, err
+	}
+	s.cacheIdempotency(cbCtx, idempotencyKey, fingerprint, result)
+	if err := s.mutationFailPoint("after_cache_write"); err != nil {
+		return nil, err
+	}
 	return &walletpb.DeductResponse{Success: true, NewBalance: newBalance}, nil
 }
 

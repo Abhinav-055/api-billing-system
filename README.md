@@ -60,6 +60,13 @@ Main responsibilities:
 3. wallet-service owns balance mutation logic
 	- DeductBalance and CreditBalance enforce idempotency and persist transaction records.
 
+Community-edition mutation recovery:
+- A permanent `idempotency:::` processing guard is inserted before replacing the wallet document.
+- The wallet replacement includes the balance and an embedded ledger row with the idempotency key and request fingerprint.
+- Retries recover that row and repair durable idempotency and transaction projections without applying the balance change again.
+- Redis is only a cache; flushing it or waiting longer than 24 hours does not expire the Couchbase guard.
+- This is recoverable, not ACID: no transaction spans the separate Couchbase documents and Redis, and the embedded ledger grows over time.
+
 Why this split is useful:
 1. NATS handles async workload and decoupling (usage -> billing -> deduction).
 2. gRPC gives immediate, strongly controlled wallet state changes for request-time checks and payment credits.

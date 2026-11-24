@@ -14,6 +14,7 @@ import (
 	walletpb "github.com/apibilling/platform/proto/wallet"
 	"github.com/couchbase/gocb/v2"
 	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -71,6 +72,25 @@ func integrationWallet(t *testing.T, available int64) (*server, string, func(str
 		holdMu.Unlock()
 	}
 	return svc, userID, trackHold
+}
+
+func integrationMutationWallet(t *testing.T, available int64) (*server, string) {
+	t.Helper()
+	svc, userID, _ := integrationWallet(t, available)
+	redisURL := os.Getenv("WALLET_TEST_REDIS_URL")
+	if redisURL == "" {
+		t.Fatal("WALLET_TEST_REDIS_URL is required for mutation integration tests")
+	}
+	options, err := redis.ParseURL(redisURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc.redis = redis.NewClient(options)
+	if err := svc.redis.Ping(context.Background()).Err(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = svc.redis.Close() })
+	return svc, userID
 }
 
 func TestConcurrentReserveFundsIntegration(t *testing.T) {
@@ -186,6 +206,127 @@ func TestReservationCallsAreIdempotentIntegration(t *testing.T) {
 	}
 	if wallet.Available != 7 || wallet.Held != 0 || len(wallet.Ledger) != 3 {
 		t.Fatalf("final wallet available=%d held=%d ledger=%d, want 7, 0, 3", wallet.Available, wallet.Held, len(wallet.Ledger))
+	}
+}
+
+func TestMutationFailureBoundariesRecoverExactlyOnceIntegration(t *testing.T) {
+	steps := []string{
+		"after_idempotency_insert",
+		"after_wallet_replace",
+		"before_ledger_write",
+		"after_ledger_write",
+		"before_cache_write",
+		"after_cache_write",
+	}
+	for _, step := range steps {
+		t.Run(step, func(t *testing.T) {
+			svc, userID := integrationMutationWallet(t, 10)
+			idempotencyKey := "failure-test:" + uuid.NewString()
+			fingerprint := "credit|" + userID + "|5|INR"
+			failed := false
+			svc.mutationFailureHook = func(current string) error {
+				if current == step && !failed {
+					failed = true
+					return errors.New("injected " + step)
+				}
+				return nil
+			}
+			response, err := svc.mutation(context.Background(), userID, 5, "credit", idempotencyKey, "test:"+idempotencyKey, "INR", fingerprint)
+			if err == nil || !failed {
+				t.Fatalf("failure injection %q did not fail: response=%v err=%v", step, response, err)
+			}
+			svc.mutationFailureHook = nil
+
+			walletResult, err := svc.collection.Get("wallet:::"+userID, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var wallet walletDoc
+			if err := walletResult.Content(&wallet); err != nil {
+				t.Fatal(err)
+			}
+			changed := step != "after_idempotency_insert"
+			if changed && (wallet.Available != 15 || len(wallet.Ledger) != 1 || wallet.Ledger[0].IdempotencyKey != idempotencyKey) {
+				t.Fatalf("post-failure wallet lost recoverable mutation: available=%d ledger=%+v", wallet.Available, wallet.Ledger)
+			}
+			if !changed && (wallet.Available != 10 || len(wallet.Ledger) != 0) {
+				t.Fatalf("pre-mutation failure changed wallet: available=%d ledger=%+v", wallet.Available, wallet.Ledger)
+			}
+			idemResult, err := svc.collection.Get("idempotency:::"+idempotencyKey, nil)
+			if err != nil {
+				t.Fatalf("recoverable idempotency record missing: %v", err)
+			}
+			var idem idempotencyDoc
+			if err := idemResult.Content(&idem); err != nil || idem.Fingerprint != fingerprint {
+				t.Fatalf("invalid idempotency record=%+v err=%v", idem, err)
+			}
+
+			replay, err := svc.mutation(context.Background(), userID, 5, "credit", idempotencyKey, "test:"+idempotencyKey, "INR", fingerprint)
+			if err != nil || replay == nil || !replay.GetSuccess() || replay.GetNewBalance() != 15 {
+				t.Fatalf("retry failed: response=%v err=%v", replay, err)
+			}
+			walletResult, err = svc.collection.Get("wallet:::"+userID, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := walletResult.Content(&wallet); err != nil {
+				t.Fatal(err)
+			}
+			if wallet.Available != 15 || len(wallet.Ledger) != 1 {
+				t.Fatalf("retry duplicated mutation: available=%d ledger=%d", wallet.Available, len(wallet.Ledger))
+			}
+			var completed idempotencyDoc
+			if result, err := svc.collection.Get("idempotency:::"+idempotencyKey, nil); err != nil || result.Content(&completed) != nil || completed.Status != "completed" {
+				t.Fatalf("idempotency record not completed: %+v err=%v", completed, err)
+			}
+			if _, err := svc.collection.Get("transaction:::"+wallet.Ledger[0].TxID, nil); err != nil {
+				t.Fatalf("transaction ledger projection missing after retry: %v", err)
+			}
+		})
+	}
+}
+
+func TestMutationReplaySurvivesRedisFlushAndElapsedTimeIntegration(t *testing.T) {
+	svc, userID := integrationMutationWallet(t, 10)
+	idempotencyKey := "durable-replay:" + uuid.NewString()
+	fingerprint := "credit|" + userID + "|5|INR"
+	first, err := svc.mutation(context.Background(), userID, 5, "credit", idempotencyKey, "test:"+idempotencyKey, "INR", fingerprint)
+	if err != nil || first == nil || !first.GetSuccess() || first.GetNewBalance() != 15 {
+		t.Fatalf("initial mutation: response=%v err=%v", first, err)
+	}
+	if err := svc.redis.FlushDB(context.Background()).Err(); err != nil {
+		t.Fatal(err)
+	}
+	result, err := svc.collection.Get("idempotency:::"+idempotencyKey, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var idem idempotencyDoc
+	if err := result.Content(&idem); err != nil {
+		t.Fatal(err)
+	}
+	idem.CreatedAt = time.Now().UTC().Add(-25 * time.Hour)
+	if _, err := svc.collection.Replace("idempotency:::"+idempotencyKey, idem, &gocb.ReplaceOptions{Cas: result.Cas()}); err != nil {
+		t.Fatal(err)
+	}
+	replayed, err := svc.mutation(context.Background(), userID, 5, "credit", idempotencyKey, "test:"+idempotencyKey, "INR", fingerprint)
+	if err != nil || replayed == nil || !replayed.GetSuccess() || replayed.GetNewBalance() != 15 {
+		t.Fatalf("durable replay: response=%v err=%v", replayed, err)
+	}
+	_, err = svc.mutation(context.Background(), userID, 6, "credit", idempotencyKey, "test:"+idempotencyKey, "INR", "different-fingerprint")
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("same key with different fingerprint err=%v, want InvalidArgument", err)
+	}
+	walletResult, err := svc.collection.Get("wallet:::"+userID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wallet walletDoc
+	if err := walletResult.Content(&wallet); err != nil {
+		t.Fatal(err)
+	}
+	if wallet.Available != 15 || len(wallet.Ledger) != 1 {
+		t.Fatalf("replay changed wallet twice: available=%d ledger=%d", wallet.Available, len(wallet.Ledger))
 	}
 }
 
