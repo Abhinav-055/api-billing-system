@@ -6,7 +6,7 @@ The platform gives you:
 1. JWT auth and API key lifecycle management
 2. Redis-backed rate limiting
 3. Usage metering and event-driven billing with NATS JetStream
-4. Wallet balance tracking and atomic debit/credit via gRPC
+4. Wallet balance tracking and serialized debit/credit via gRPC
 5. Razorpay payment order creation and payment confirmation flow
 6. Couchbase persistence for users, keys, usage, orders, and transactions
 7. Frontend control plane for dashboard, wallet, keys, and logs
@@ -64,7 +64,7 @@ Community-edition mutation recovery:
 - A permanent `idempotency:::` processing guard is inserted before replacing the wallet document.
 - The wallet replacement includes the balance and an embedded ledger row with the idempotency key and request fingerprint.
 - Retries recover that row and repair durable idempotency and transaction projections without applying the balance change again.
-- Redis is only a cache; flushing it or waiting longer than 24 hours does not expire the Couchbase guard.
+- Redis is only a cache; flushing or expiring it does not remove the Couchbase guard.
 - This is recoverable, not ACID: no transaction spans the separate Couchbase documents and Redis, and the embedded ledger grows over time.
 
 Why this split is useful:
@@ -105,18 +105,27 @@ Current behavior:
 1. Frontend checkout success calls POST /payments/confirm with order id, payment id, signature.
 2. Backend verifies signature with Razorpay key secret and processes credit + transaction.
 3. Webhook endpoint /payments/webhook is still live and can also process payment.captured from Razorpay.
-4. If webhook arrives later for the same order, processing is idempotent (status == completed check), so no double credit.
+4. Confirm and webhook compete through a CAS `pending -> processing` transition. A completed replay
+   is a no-op, and wallet credit is idempotent, so retries do not double-credit.
 
 Notes:
-1. The confirm path gives immediate UX feedback after payment success.
-2. Webhook is retained as resilient fallback for asynchronous provider delivery.
+1. Orders require whole-rupee INR amounts within `MIN_ORDER_AMOUNT_MINOR` and
+   `MAX_ORDER_AMOUNT_MINOR`; fractional rupees and non-positive/over-maximum values are rejected.
+2. Confirm/webhook verify signatures and stored amount/currency before credit; credit failure leaves
+   the order retryable in `processing`.
+3. The confirm path gives immediate UX feedback after payment success.
+4. Webhook is retained as resilient fallback for asynchronous provider delivery.
+
+The metered sample endpoints `/api/v1/data` and `/api/v1/compute` intentionally use GET while
+reserving and capturing credits and publishing usage. Therefore, “GET routes have no side effects”
+is not true for those paid routes. Read-only routes such as wallet balance and usage queries do not
+perform wallet mutations.
 
 ## Razorpay Status
 
-Razorpay API is working in this setup.
-1. Order creation is verified with test key id/secret against Razorpay Orders API.
-2. App order creation endpoint returns valid order_id and key_id.
-3. Confirm endpoint validates Razorpay signature and processes wallet credit.
+The payment-service integration and local signature/confirmation paths are covered by tests. Live
+Razorpay Orders API creation was not exercised in this verification run; do not treat local
+confirmation/webhook tests as proof of provider connectivity.
 
 ## Environment Variables
 
@@ -141,6 +150,10 @@ Environment defaults and limits:
 2. `MIN_ORDER_AMOUNT_MINOR=100`, `MAX_ORDER_AMOUNT_MINOR=10000000`
 3. `HOLD_TTL=5m`, `SWEEP_INTERVAL=1m`
 4. `PAYMENT_PROCESSING_TIMEOUT=60s`
+
+Order amount limits are in paise, and accepted order amounts must also be divisible by 100. The
+wallet sweeper releases expired HELD reservations eventually; it is not an ACID transaction or an
+immediate expiry guarantee.
 
 Infra defaults (compose-ready):
 1. REDIS_URL=redis://redis:6379
