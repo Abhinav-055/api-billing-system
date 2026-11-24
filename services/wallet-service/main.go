@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"math/rand"
 	"net"
 	"net/http"
 	"os"
@@ -30,9 +31,11 @@ import (
 )
 
 const (
-	serviceName      = "wallet-service"
-	couchbaseTimeout = 10 * time.Second
-	lockDuration     = 10 * time.Second
+	serviceName            = "wallet-service"
+	couchbaseTimeout       = 10 * time.Second
+	lockDuration           = 10 * time.Second
+	walletMutationBudget   = 2500 * time.Millisecond
+	walletMutationAttempts = 6
 )
 
 type configType struct {
@@ -467,6 +470,16 @@ func (s *server) CreditBalance(ctx context.Context, req *walletpb.CreditRequest)
 }
 
 func (s *server) ReserveFunds(ctx context.Context, req *walletpb.ReserveFundsRequest) (*walletpb.ReserveFundsResponse, error) {
+	var response *walletpb.ReserveFundsResponse
+	err := s.retryWalletOperation(ctx, "ReserveFunds", func(attemptCtx context.Context) error {
+		var err error
+		response, err = s.reserveFundsOnce(attemptCtx, req)
+		return err
+	})
+	return response, err
+}
+
+func (s *server) reserveFundsOnce(ctx context.Context, req *walletpb.ReserveFundsRequest) (*walletpb.ReserveFundsResponse, error) {
 	if req.GetAmountMinor() <= 0 || strings.TrimSpace(req.GetReservationId()) == "" {
 		return &walletpb.ReserveFundsResponse{Reserved: false, Reason: "INVALID_REQUEST"}, nil
 	}
@@ -534,6 +547,16 @@ func (s *server) ReserveFunds(ctx context.Context, req *walletpb.ReserveFundsReq
 }
 
 func (s *server) CaptureReservation(ctx context.Context, req *walletpb.CaptureReservationRequest) (*walletpb.CaptureReservationResponse, error) {
+	var response *walletpb.CaptureReservationResponse
+	err := s.retryWalletOperation(ctx, "CaptureReservation", func(attemptCtx context.Context) error {
+		var err error
+		response, err = s.captureReservationOnce(attemptCtx, req)
+		return err
+	})
+	return response, err
+}
+
+func (s *server) captureReservationOnce(ctx context.Context, req *walletpb.CaptureReservationRequest) (*walletpb.CaptureReservationResponse, error) {
 	holdKey := "hold:::" + req.GetReservationId()
 	res, err := s.collection.Get(holdKey, &gocb.GetOptions{Context: ctx})
 	if errors.Is(err, gocb.ErrDocumentNotFound) {
@@ -595,6 +618,16 @@ func (s *server) CaptureReservation(ctx context.Context, req *walletpb.CaptureRe
 }
 
 func (s *server) ReleaseReservation(ctx context.Context, req *walletpb.ReleaseReservationRequest) (*walletpb.ReleaseReservationResponse, error) {
+	var response *walletpb.ReleaseReservationResponse
+	err := s.retryWalletOperation(ctx, "ReleaseReservation", func(attemptCtx context.Context) error {
+		var err error
+		response, err = s.releaseReservationOnce(attemptCtx, req)
+		return err
+	})
+	return response, err
+}
+
+func (s *server) releaseReservationOnce(ctx context.Context, req *walletpb.ReleaseReservationRequest) (*walletpb.ReleaseReservationResponse, error) {
 	holdKey := "hold:::" + req.GetReservationId()
 	res, err := s.collection.Get(holdKey, &gocb.GetOptions{Context: ctx})
 	if errors.Is(err, gocb.ErrDocumentNotFound) {
@@ -645,6 +678,65 @@ func (s *server) ReleaseReservation(ctx context.Context, req *walletpb.ReleaseRe
 		return nil, err
 	}
 	return &walletpb.ReleaseReservationResponse{Released: true, AvailableBalance: w.Available}, nil
+}
+
+func (s *server) retryWalletOperation(ctx context.Context, operation string, run func(context.Context) error) error {
+	retryCtx, cancel := context.WithTimeout(ctx, walletMutationBudget)
+	defer cancel()
+
+	var lastErr error
+	for attempt := 0; attempt < walletMutationAttempts; attempt++ {
+		if err := retryCtx.Err(); err != nil {
+			break
+		}
+		lastErr = run(retryCtx)
+		if lastErr == nil || !isWalletContentionError(lastErr) {
+			return lastErr
+		}
+		if attempt == walletMutationAttempts-1 {
+			break
+		}
+		s.logger.Warn("wallet mutation retry",
+			slog.String("operation", operation),
+			slog.Int("retry_count", attempt+1),
+			slog.String("error", lastErr.Error()))
+		delay := walletContentionDelay(attempt)
+		timer := time.NewTimer(delay)
+		select {
+		case <-retryCtx.Done():
+			timer.Stop()
+			break
+		case <-timer.C:
+		}
+		if retryCtx.Err() != nil {
+			break
+		}
+	}
+	if isWalletContentionError(lastErr) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return status.Error(codes.ResourceExhausted, "WALLET_CONTENTION_EXHAUSTED")
+	}
+	return lastErr
+}
+
+func isWalletContentionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, gocb.ErrDocumentLocked) || errors.Is(err, gocb.ErrCasMismatch) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "document is locked") ||
+		strings.Contains(msg, "document locked") ||
+		strings.Contains(msg, "cas mismatch")
+}
+
+func walletContentionDelay(attempt int) time.Duration {
+	base := 25 * time.Millisecond * time.Duration(1<<attempt)
+	return base + time.Duration(rand.Int63n(int64(base/2)+1))
 }
 
 func captureHoldState(wallet walletDoc, hold holdDoc, actual int64, now time.Time) (walletDoc, holdDoc, error) {

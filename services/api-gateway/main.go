@@ -29,7 +29,9 @@ import (
 	"github.com/redis/go-redis/v9"
 	"golang.org/x/crypto/bcrypt"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 )
 
 const (
@@ -496,6 +498,11 @@ func (a *app) reservationMiddleware(next http.Handler) http.Handler {
 		})
 		cancel()
 		if err != nil {
+			if status.Code(err) == codes.ResourceExhausted {
+				w.Header().Set("Retry-After", "1")
+				writeJSONError(w, http.StatusServiceUnavailable, "WALLET_BUSY", "wallet contention; retry shortly")
+				return
+			}
 			writeJSONError(w, http.StatusServiceUnavailable, "WALLET_UNAVAILABLE", "wallet unavailable")
 			return
 		}

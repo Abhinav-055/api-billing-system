@@ -3,12 +3,57 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
+	"log/slog"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/apibilling/platform/pkg/events"
+	"github.com/couchbase/gocb/v2"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
+
+func TestWalletMutationRetriesLockContention(t *testing.T) {
+	svc := &server{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	attempts := 0
+	err := svc.retryWalletOperation(context.Background(), "test", func(context.Context) error {
+		attempts++
+		if attempts < 3 {
+			return gocb.ErrDocumentLocked
+		}
+		return nil
+	})
+	if err != nil || attempts != 3 {
+		t.Fatalf("err=%v attempts=%d, want success on third attempt", err, attempts)
+	}
+}
+
+func TestWalletMutationDoesNotRetryOutage(t *testing.T) {
+	svc := &server{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	attempts := 0
+	wantErr := errors.New("connection refused")
+	err := svc.retryWalletOperation(context.Background(), "test", func(context.Context) error {
+		attempts++
+		return wantErr
+	})
+	if !errors.Is(err, wantErr) || attempts != 1 {
+		t.Fatalf("err=%v attempts=%d, want original error after one attempt", err, attempts)
+	}
+}
+
+func TestWalletMutationContentionExhaustionIsRetryable(t *testing.T) {
+	svc := &server{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	attempts := 0
+	err := svc.retryWalletOperation(context.Background(), "test", func(context.Context) error {
+		attempts++
+		return gocb.ErrDocumentLocked
+	})
+	if status.Code(err) != codes.ResourceExhausted || attempts != walletMutationAttempts {
+		t.Fatalf("err=%v code=%s attempts=%d", err, status.Code(err), attempts)
+	}
+}
 
 func TestLegacyFloatToMinorUnits(t *testing.T) {
 	if got := legacyFloatToMinorUnits(12.4); got != 12 {
