@@ -146,11 +146,15 @@ func rupeesJSONToPaise(raw json.RawMessage) (int64, error) {
 	return amountPaise, nil
 }
 
+type paymentPublisher interface {
+	PublishPaymentSuccess(context.Context, events.PaymentSuccessEvent) error
+}
+
 type service struct {
 	logger       *slog.Logger
 	collection   *gocb.Collection
 	cluster      *gocb.Cluster
-	publisher    *events.Publisher
+	publisher    paymentPublisher
 	walletClient walletpb.WalletServiceClient
 	jwtSecret    string
 	rzpClient    *razorpay.Client
@@ -618,6 +622,16 @@ func (s *service) processCapturedPayment(reqCtx context.Context, orderID, paymen
 		samePayment := order.PaymentID == paymentID
 		if !stale && !samePayment {
 			return fmt.Errorf("PAYMENT_PROCESSING_CONFLICT")
+		}
+		if stale && !samePayment {
+			order.PaymentID = paymentID
+			order.ProcessingStartedAt = time.Now().UTC()
+			if _, err := s.collection.Replace(key, order, &gocb.ReplaceOptions{Cas: orderResult.Cas(), Context: ctx}); err != nil {
+				if errors.Is(err, gocb.ErrCasMismatch) {
+					return fmt.Errorf("PAYMENT_PROCESSING_CONFLICT")
+				}
+				return err
+			}
 		}
 	} else if order.Status == "pending" {
 		order.Status = "processing"
