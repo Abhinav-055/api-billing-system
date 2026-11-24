@@ -9,11 +9,12 @@ declare global {
   interface Window {
     Razorpay: new (options: Record<string, unknown>) => { open: () => void };
   }
+
 }
 
 export default function WalletPage() {
   const [balance, setBalance] = useState<number>(0);
-  const [amount, setAmount] = useState<number>(100);
+  const [amount, setAmount] = useState<number>(10000);
   const [transactions, setTransactions] = useState<Transaction[]>([]);
   const [error, setError] = useState<string>("");
 
@@ -41,7 +42,7 @@ export default function WalletPage() {
 
   const addCredits = async () => {
     try {
-      const { data } = await appApi.post("/proxy/payments/create-order", { amount });
+      const { data } = await appApi.post("/proxy/payments/create-order", { amount_minor: amount });
       const order = data;
 
       if (!window.Razorpay) {
@@ -102,7 +103,7 @@ export default function WalletPage() {
           value={amount}
           onChange={(event) => setAmount(Number(event.target.value))}
           type="number"
-          min={10}
+          min={100}
           className="mt-1 w-full rounded-xl border border-muted/30 bg-panel px-3 py-2 text-ink"
         />
 

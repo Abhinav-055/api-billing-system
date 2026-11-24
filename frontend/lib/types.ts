@@ -19,6 +19,8 @@ export type UsageLog = {
 export type WalletBalance = {
   user_id: string;
   balance: number;
+  held: number;
+  currency: string;
   has_sufficient_funds: boolean;
 };
 

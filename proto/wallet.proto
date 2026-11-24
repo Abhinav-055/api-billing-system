@@ -6,6 +6,9 @@ option go_package = "./proto/wallet";
 
 service WalletService {
   rpc CheckBalance (BalanceRequest) returns (BalanceResponse);
+  rpc ReserveFunds (ReserveFundsRequest) returns (ReserveFundsResponse);
+  rpc CaptureReservation (CaptureReservationRequest) returns (CaptureReservationResponse);
+  rpc ReleaseReservation (ReleaseReservationRequest) returns (ReleaseReservationResponse);
   rpc DeductBalance (DeductRequest) returns (DeductResponse);
   rpc CreditBalance (CreditRequest) returns (CreditResponse);
 }
@@ -16,30 +19,68 @@ message BalanceRequest {
 
 message BalanceResponse {
   string user_id = 1;
-  double balance = 2;
+  int64 balance = 2;
+  int64 held = 4;
+  string currency = 5;
   bool has_sufficient_funds = 3;
 }
 
 message DeductRequest {
   string user_id = 1;
-  double amount = 2;
+  int64 amount_minor = 2;
   string idempotency_key = 3;
 }
 
 message DeductResponse {
   bool success = 1;
-  double new_balance = 2;
+  int64 new_balance = 2;
   string error = 3;
 }
 
 message CreditRequest {
   string user_id = 1;
-  double amount = 2;
+  int64 amount_minor = 2;
   string idempotency_key = 3;
+  string currency = 4;
 }
 
 message CreditResponse {
   bool success = 1;
-  double new_balance = 2;
+  int64 new_balance = 2;
   string error = 3;
+}
+
+message ReserveFundsRequest {
+  string user_id = 1;
+  int64 amount_minor = 2;
+  string reservation_id = 3;
+  int64 ttl_seconds = 4;
+  string currency = 5;
+}
+
+message ReserveFundsResponse {
+  bool reserved = 1;
+  string reason = 2;
+  int64 available_balance = 3;
+}
+
+message CaptureReservationRequest {
+  string reservation_id = 1;
+  int64 actual_amount = 2;
+}
+
+message CaptureReservationResponse {
+  bool captured = 1;
+  string reason = 2;
+  int64 available_balance = 3;
+}
+
+message ReleaseReservationRequest {
+  string reservation_id = 1;
+}
+
+message ReleaseReservationResponse {
+  bool released = 1;
+  string reason = 2;
+  int64 available_balance = 3;
 }

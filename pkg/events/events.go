@@ -43,7 +43,7 @@ func SetupStreams(js jetstream.JetStream) error {
 		},
 		{
 			Name:      "WALLET",
-			Subjects:  []string{SubjectWalletDeduct},
+			Subjects:  []string{SubjectWalletDeduct, "wallet.capture", "wallet.dlq"},
 			Retention: jetstream.WorkQueuePolicy,
 			Replicas:  1,
 		},
@@ -87,6 +87,10 @@ func (p *Publisher) PublishUsage(ctx context.Context, evt UsageEvent) error {
 
 func (p *Publisher) PublishWalletDeduct(ctx context.Context, evt WalletDeductEvent) error {
 	return p.publish(ctx, SubjectWalletDeduct, evt)
+}
+
+func (p *Publisher) PublishWalletCapture(ctx context.Context, evt WalletCaptureEvent) error {
+	return p.publish(ctx, SubjectWalletCapture, evt)
 }
 
 func (p *Publisher) PublishPaymentSuccess(ctx context.Context, evt PaymentSuccessEvent) error {
