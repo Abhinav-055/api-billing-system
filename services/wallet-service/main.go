@@ -35,6 +35,8 @@ const (
 	couchbaseTimeout       = 10 * time.Second
 	lockDuration           = 10 * time.Second
 	walletMutationBudget   = 2500 * time.Millisecond
+	walletAttemptBudget    = 500 * time.Millisecond
+	walletLockTimeout      = 250 * time.Millisecond
 	walletMutationAttempts = 6
 )
 
@@ -493,7 +495,7 @@ func (s *server) reserveFundsOnce(ctx context.Context, req *walletpb.ReserveFund
 	holdKey := "hold:::" + req.GetReservationId()
 
 	walletKey := "wallet:::" + req.GetUserId()
-	lockRes, err := s.collection.GetAndLock(walletKey, lockDuration, &gocb.GetAndLockOptions{Context: ctx})
+	lockRes, err := s.collection.GetAndLock(walletKey, lockDuration, &gocb.GetAndLockOptions{Context: ctx, Timeout: walletLockTimeout})
 	if errors.Is(err, gocb.ErrDocumentNotFound) {
 		return &walletpb.ReserveFundsResponse{Reserved: false, Reason: "INSUFFICIENT_FUNDS"}, nil
 	}
@@ -575,7 +577,7 @@ func (s *server) captureReservationOnce(ctx context.Context, req *walletpb.Captu
 	}
 
 	walletKey := "wallet:::" + projection.UserID
-	lockRes, err := s.collection.GetAndLock(walletKey, lockDuration, &gocb.GetAndLockOptions{Context: ctx})
+	lockRes, err := s.collection.GetAndLock(walletKey, lockDuration, &gocb.GetAndLockOptions{Context: ctx, Timeout: walletLockTimeout})
 	if err != nil {
 		return nil, err
 	}
@@ -642,7 +644,7 @@ func (s *server) releaseReservationOnce(ctx context.Context, req *walletpb.Relea
 	}
 
 	walletKey := "wallet:::" + projection.UserID
-	lockRes, err := s.collection.GetAndLock(walletKey, lockDuration, &gocb.GetAndLockOptions{Context: ctx})
+	lockRes, err := s.collection.GetAndLock(walletKey, lockDuration, &gocb.GetAndLockOptions{Context: ctx, Timeout: walletLockTimeout})
 	if err != nil {
 		return nil, err
 	}
@@ -689,7 +691,9 @@ func (s *server) retryWalletOperation(ctx context.Context, operation string, run
 		if err := retryCtx.Err(); err != nil {
 			break
 		}
-		lastErr = run(retryCtx)
+		attemptCtx, cancelAttempt := context.WithTimeout(retryCtx, walletAttemptBudget)
+		lastErr = run(attemptCtx)
+		cancelAttempt()
 		if lastErr == nil || !isWalletContentionError(lastErr) {
 			return lastErr
 		}
@@ -731,7 +735,8 @@ func isWalletContentionError(err error) bool {
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "document is locked") ||
 		strings.Contains(msg, "document locked") ||
-		strings.Contains(msg, "cas mismatch")
+		strings.Contains(msg, "cas mismatch") ||
+		strings.Contains(msg, "kv_locked")
 }
 
 func walletContentionDelay(attempt int) time.Duration {
