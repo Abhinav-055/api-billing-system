@@ -3,7 +3,6 @@ package events
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 
 	"github.com/nats-io/nats.go"
@@ -56,17 +55,8 @@ func SetupStreams(js jetstream.JetStream) error {
 	}
 
 	for _, cfg := range streams {
-		_, err := js.Stream(ctx, cfg.Name)
-		if err == nil {
-			continue
-		}
-
-		if !errors.Is(err, jetstream.ErrStreamNotFound) {
-			return fmt.Errorf("check stream %s: %w", cfg.Name, err)
-		}
-
-		if _, createErr := js.CreateStream(ctx, cfg); createErr != nil {
-			return fmt.Errorf("create stream %s: %w", cfg.Name, createErr)
+		if _, err := js.CreateOrUpdateStream(ctx, cfg); err != nil {
+			return fmt.Errorf("create or update stream %s: %w", cfg.Name, err)
 		}
 	}
 

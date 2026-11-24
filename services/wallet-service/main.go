@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -95,13 +97,32 @@ type holdDoc struct {
 }
 
 type failedChargeDoc struct {
-	ID              string          `json:"id"`
-	UserID          string          `json:"user_id"`
-	AmountMinor     int64           `json:"amount_minor"`
-	Reason          string          `json:"reason"`
-	OriginalPayload json.RawMessage `json:"original_payload"`
-	CreatedAt       time.Time       `json:"created_at"`
+	ID              string    `json:"id"`
+	UserID          string    `json:"user_id"`
+	AmountMinor     int64     `json:"amount_minor"`
+	Reason          string    `json:"reason"`
+	OriginalPayload string    `json:"original_payload"`
+	CreatedAt       time.Time `json:"created_at"`
+	DeliveryCount   uint64    `json:"delivery_count"`
 }
+
+const walletMaxDeliver = 5
+
+type deliveryDisposition uint8
+
+const (
+	deliveryAck deliveryDisposition = iota
+	deliveryTerm
+	deliveryNak
+)
+
+type walletBusinessError struct{ reason string }
+
+func (e walletBusinessError) Error() string { return e.reason }
+
+type malformedWalletPayload struct{}
+
+func (malformedWalletPayload) Error() string { return "MALFORMED_PAYLOAD" }
 
 type server struct {
 	walletpb.UnimplementedWalletServiceServer
@@ -641,8 +662,14 @@ func isTransientError(err error) bool {
 	if err == nil {
 		return false
 	}
+	if errors.Is(err, gocb.ErrTimeout) ||
+		errors.Is(err, gocb.ErrTemporaryFailure) ||
+		errors.Is(err, gocb.ErrDocumentLocked) ||
+		errors.Is(err, gocb.ErrCasMismatch) {
+		return true
+	}
 	msg := strings.ToLower(err.Error())
-	for _, needle := range []string{"timeout", "temporary", "cas", "lock", "network", "couchbase", "redis", "unavailable"} {
+	for _, needle := range []string{"timeout", "temporary", "cas", "locked", "lock contention", "network", "connection reset", "unavailable"} {
 		if strings.Contains(msg, needle) {
 			return true
 		}
@@ -650,69 +677,206 @@ func isTransientError(err error) bool {
 	return false
 }
 
+type walletEventProcessor func(context.Context, string, []byte) error
+type failedChargeRecorder func(context.Context, string, []byte, uint64, error) error
+type walletDLQPublisher func(context.Context, []byte) error
+
+func processWalletDelivery(
+	ctx context.Context,
+	subject string,
+	payload []byte,
+	deliveryCount uint64,
+	process walletEventProcessor,
+	recordFailure failedChargeRecorder,
+	publishDLQ walletDLQPublisher,
+) deliveryDisposition {
+	if subject != events.SubjectWalletCapture && subject != events.SubjectWalletDeduct {
+		if err := recordFailure(ctx, subject, payload, deliveryCount, malformedWalletPayload{}); err != nil {
+			return auditFailureDisposition(ctx, payload, deliveryCount, publishDLQ)
+		}
+		return deliveryTerm
+	}
+	if len(payload) == 0 || !json.Valid(payload) {
+		if err := recordFailure(ctx, subject, payload, deliveryCount, malformedWalletPayload{}); err != nil {
+			return auditFailureDisposition(ctx, payload, deliveryCount, publishDLQ)
+		}
+		return deliveryTerm
+	}
+	err := process(ctx, subject, payload)
+	if err == nil {
+		return deliveryAck
+	}
+	var malformed malformedWalletPayload
+	var business walletBusinessError
+	if errors.As(err, &malformed) || errors.As(err, &business) {
+		if recordErr := recordFailure(ctx, subject, payload, deliveryCount, err); recordErr != nil {
+			return auditFailureDisposition(ctx, payload, deliveryCount, publishDLQ)
+		}
+		return deliveryTerm
+	}
+	if !isTransientError(err) {
+		if recordErr := recordFailure(ctx, subject, payload, deliveryCount, err); recordErr != nil {
+			return auditFailureDisposition(ctx, payload, deliveryCount, publishDLQ)
+		}
+		return deliveryTerm
+	}
+	if deliveryCount >= walletMaxDeliver {
+		if dlqErr := publishDLQ(ctx, payload); dlqErr != nil {
+			return deliveryNak
+		}
+		return deliveryTerm
+	}
+	return deliveryNak
+}
+
+func auditFailureDisposition(ctx context.Context, payload []byte, deliveryCount uint64, publishDLQ walletDLQPublisher) deliveryDisposition {
+	if deliveryCount >= walletMaxDeliver {
+		if err := publishDLQ(ctx, payload); err != nil {
+			return deliveryNak
+		}
+		return deliveryTerm
+	}
+	return deliveryNak
+}
+
 func (s *server) subscribeWalletEvents(ctx context.Context) {
 	nc, js, err := events.Connect(s.cfg.NATSURL)
 	if err != nil {
+		s.logger.Error("wallet NATS connection failed", slog.String("error", err.Error()))
 		return
 	}
 	defer nc.Close()
 	if err := events.SetupStreams(js); err != nil {
+		s.logger.Error("wallet stream setup failed", slog.String("error", err.Error()))
 		return
 	}
-	consumer, err := js.CreateOrUpdateConsumer(ctx, "WALLET", jetstream.ConsumerConfig{Durable: "wallet-deduct", FilterSubject: "wallet.>", AckPolicy: jetstream.AckExplicitPolicy, AckWait: 30 * time.Second, MaxDeliver: 5, BackOff: []time.Duration{1 * time.Second, 5 * time.Second, 15 * time.Second, 30 * time.Second}})
-	if err != nil {
-		return
-	}
-	_, err = consumer.Consume(func(msg jetstream.Msg) {
-		meta, _ := msg.Metadata()
-		if len(msg.Data()) == 0 {
-			msg.Term()
-			return
-		}
-		var handleErr error
-		switch msg.Subject() {
-		case events.SubjectWalletCapture:
-			var evt events.WalletCaptureEvent
-			if err := json.Unmarshal(msg.Data(), &evt); err != nil {
-				handleErr = fmt.Errorf("malformed payload")
-			} else {
-				_, handleErr = s.CaptureReservation(ctx, &walletpb.CaptureReservationRequest{ReservationId: evt.ReservationID, ActualAmount: evt.ActualAmount})
-			}
-		case events.SubjectWalletDeduct:
-			var evt events.WalletDeductEvent
-			if err := json.Unmarshal(msg.Data(), &evt); err != nil {
-				handleErr = fmt.Errorf("malformed payload")
-			} else {
-				_, handleErr = s.DeductBalance(ctx, &walletpb.DeductRequest{UserId: evt.UserID, AmountMinor: evt.AmountMinor, IdempotencyKey: evt.IdempotencyKey})
-			}
-		default:
-			handleErr = fmt.Errorf("malformed payload")
-		}
-		if handleErr != nil {
-			if isTransientError(handleErr) {
-				if meta != nil && meta.NumDelivered >= 5 {
-					_, _ = js.Publish(ctx, events.SubjectWalletDLQ, msg.Data())
-					msg.Term()
-					return
-				}
-				msg.NakWithDelay(time.Duration(meta.NumDelivered) * time.Second)
-				return
-			}
-			s.writeFailedCharge(msg.Data(), handleErr)
-			msg.Term()
-			return
-		}
-		msg.Ack()
+	consumer, err := js.CreateOrUpdateConsumer(ctx, "WALLET", jetstream.ConsumerConfig{
+		Durable:        "wallet-deduct",
+		FilterSubjects: []string{events.SubjectWalletDeduct, events.SubjectWalletCapture},
+		AckPolicy:      jetstream.AckExplicitPolicy,
+		AckWait:        30 * time.Second,
+		MaxDeliver:     walletMaxDeliver,
+		BackOff:        []time.Duration{1 * time.Second, 5 * time.Second, 15 * time.Second, 30 * time.Second},
 	})
 	if err != nil {
+		s.logger.Error("wallet consumer creation failed", slog.String("error", err.Error()))
+		return
+	}
+	info, err := consumer.Info(ctx)
+	if err != nil {
+		s.logger.Error("wallet consumer info failed", slog.String("error", err.Error()))
+		return
+	}
+	if info.Config.MaxDeliver != walletMaxDeliver {
+		s.logger.Error("wallet consumer MaxDeliver mismatch", slog.Int("max_deliver", info.Config.MaxDeliver))
+		return
+	}
+	s.logger.Info("wallet consumer ready", slog.String("consumer", info.Name), slog.Int("max_deliver", info.Config.MaxDeliver))
+	_, err = consumer.Consume(func(msg jetstream.Msg) {
+		count := uint64(1)
+		if meta, metaErr := msg.Metadata(); metaErr != nil {
+			s.logger.Error("wallet message metadata unavailable", slog.String("error", metaErr.Error()))
+		} else {
+			count = meta.NumDelivered
+		}
+		disposition := processWalletDelivery(ctx, msg.Subject(), msg.Data(), count, s.processWalletEvent, s.recordFailedCharge,
+			func(publishCtx context.Context, payload []byte) error {
+				_, publishErr := js.Publish(publishCtx, events.SubjectWalletDLQ, payload)
+				return publishErr
+			})
+		switch disposition {
+		case deliveryAck:
+			_ = msg.Ack()
+		case deliveryTerm:
+			_ = msg.Term()
+		case deliveryNak:
+			if count >= walletMaxDeliver {
+				s.logger.Error("wallet DLQ publish or failed-charge persistence failed; original message remains unacknowledged",
+					slog.String("subject", msg.Subject()), slog.Uint64("delivery_count", count))
+			}
+			_ = msg.NakWithDelay(walletBackoff(count))
+		}
+	})
+	if err != nil {
+		s.logger.Error("wallet consume failed", slog.String("error", err.Error()))
 		return
 	}
 	<-ctx.Done()
 }
 
-func (s *server) writeFailedCharge(payload []byte, reason error) {
-	doc := failedChargeDoc{ID: "failed_" + strings.ReplaceAll(uuid.NewString(), "-", ""), Reason: reason.Error(), OriginalPayload: json.RawMessage(payload), CreatedAt: time.Now().UTC()}
-	_, _ = s.collection.Insert("failed_charge:::"+doc.ID, doc, &gocb.InsertOptions{Context: context.Background()})
+func minUint64(a, b uint64) uint64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func walletBackoff(deliveryCount uint64) time.Duration {
+	schedule := [...]time.Duration{time.Second, 5 * time.Second, 15 * time.Second, 30 * time.Second}
+	index := minUint64(deliveryCount-1, uint64(len(schedule)-1))
+	return schedule[index]
+}
+
+func (s *server) processWalletEvent(ctx context.Context, subject string, payload []byte) error {
+	switch subject {
+	case events.SubjectWalletCapture:
+		var evt events.WalletCaptureEvent
+		if err := json.Unmarshal(payload, &evt); err != nil || evt.ReservationID == "" || evt.UserID == "" {
+			return malformedWalletPayload{}
+		}
+		resp, err := s.CaptureReservation(ctx, &walletpb.CaptureReservationRequest{ReservationId: evt.ReservationID, ActualAmount: evt.ActualAmount})
+		if err != nil {
+			return err
+		}
+		if !resp.GetCaptured() {
+			return walletBusinessError{reason: resp.GetReason()}
+		}
+		return nil
+	case events.SubjectWalletDeduct:
+		var evt events.WalletDeductEvent
+		if err := json.Unmarshal(payload, &evt); err != nil || evt.UserID == "" || evt.IdempotencyKey == "" || evt.AmountMinor <= 0 {
+			return malformedWalletPayload{}
+		}
+		resp, err := s.DeductBalance(ctx, &walletpb.DeductRequest{UserId: evt.UserID, AmountMinor: evt.AmountMinor, IdempotencyKey: evt.IdempotencyKey})
+		if err != nil {
+			return err
+		}
+		if !resp.GetSuccess() {
+			return walletBusinessError{reason: resp.GetError()}
+		}
+		return nil
+	default:
+		return malformedWalletPayload{}
+	}
+}
+
+func (s *server) recordFailedCharge(ctx context.Context, subject string, payload []byte, deliveryCount uint64, reason error) error {
+	var details struct {
+		UserID        string `json:"user_id"`
+		AmountMinor   int64  `json:"amount_minor"`
+		Amount        int64  `json:"actual_amount"`
+		ReservationID string `json:"reservation_id"`
+	}
+	_ = json.Unmarshal(payload, &details)
+	if details.AmountMinor == 0 {
+		details.AmountMinor = details.Amount
+	}
+	hash := sha256.Sum256(append(append([]byte(subject), 0), payload...))
+	id := hex.EncodeToString(hash[:])
+	doc := failedChargeDoc{
+		ID:              id,
+		UserID:          details.UserID,
+		AmountMinor:     details.AmountMinor,
+		Reason:          reason.Error(),
+		OriginalPayload: string(payload),
+		CreatedAt:       time.Now().UTC(),
+		DeliveryCount:   deliveryCount,
+	}
+	_, err := s.collection.Insert("failed_charge:::"+doc.ID, doc, &gocb.InsertOptions{Context: ctx})
+	if errors.Is(err, gocb.ErrDocumentExists) {
+		return nil
+	}
+	return err
 }
 
 func (s *server) startHealthServer(port string) {
