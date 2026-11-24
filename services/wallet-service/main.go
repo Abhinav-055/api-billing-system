@@ -51,14 +51,15 @@ type configType struct {
 }
 
 type walletDoc struct {
-	UserID      string    `json:"user_id"`
-	Available   int64     `json:"available"`
-	Balance     int64     `json:"balance,omitempty"`
-	Held        int64     `json:"held"`
-	Currency    string    `json:"currency"`
-	AppliedKeys []string  `json:"applied_keys,omitempty"`
-	Ledger      []txDoc   `json:"embedded_ledger,omitempty"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	UserID      string             `json:"user_id"`
+	Available   int64              `json:"available"`
+	Balance     int64              `json:"balance,omitempty"`
+	Held        int64              `json:"held"`
+	Currency    string             `json:"currency"`
+	AppliedKeys []string           `json:"applied_keys,omitempty"`
+	Ledger      []txDoc            `json:"embedded_ledger,omitempty"`
+	Holds       map[string]holdDoc `json:"holds,omitempty"`
+	UpdatedAt   time.Time          `json:"updated_at"`
 }
 
 type txDoc struct {
@@ -222,10 +223,16 @@ func newServer(cfg configType, logger *slog.Logger) (*server, error) {
 	collection := bucket.DefaultCollection()
 	indexCtx, indexCancel := context.WithTimeout(context.Background(), couchbaseTimeout)
 	defer indexCancel()
-	_, _ = cluster.Query(
+	indexResult, err := cluster.Query(
 		fmt.Sprintf("CREATE INDEX IF NOT EXISTS idx_hold_status_expires ON `%s`(status, expires_at) WHERE META().id LIKE 'hold::%%'", cfg.CouchbaseBucket),
 		&gocb.QueryOptions{Context: indexCtx},
 	)
+	if err != nil {
+		return nil, fmt.Errorf("create hold expiry index: %w", err)
+	}
+	if err := indexResult.Close(); err != nil {
+		return nil, fmt.Errorf("finish hold expiry index creation: %w", err)
+	}
 	return &server{cfg: cfg, logger: logger, redis: r, cluster: cluster, collection: collection, startedAt: time.Now().UTC()}, nil
 }
 
@@ -463,22 +470,14 @@ func (s *server) ReserveFunds(ctx context.Context, req *walletpb.ReserveFundsReq
 	if req.GetAmountMinor() <= 0 || strings.TrimSpace(req.GetReservationId()) == "" {
 		return &walletpb.ReserveFundsResponse{Reserved: false, Reason: "INVALID_REQUEST"}, nil
 	}
+	if strings.TrimSpace(req.GetUserId()) == "" {
+		return &walletpb.ReserveFundsResponse{Reserved: false, Reason: "INVALID_REQUEST"}, nil
+	}
 	currency := req.GetCurrency()
 	if currency == "" {
 		currency = "INR"
 	}
 	holdKey := "hold:::" + req.GetReservationId()
-	if res, err := s.collection.Get(holdKey, &gocb.GetOptions{Context: ctx}); err == nil {
-		var hold holdDoc
-		if err := res.Content(&hold); err == nil {
-			if hold.Status == "HELD" {
-				return &walletpb.ReserveFundsResponse{Reserved: true, AvailableBalance: 0}, nil
-			}
-			if hold.Status == "CAPTURED" || hold.Status == "RELEASED" {
-				return &walletpb.ReserveFundsResponse{Reserved: false, Reason: "RESERVATION_CLOSED"}, nil
-			}
-		}
-	}
 
 	walletKey := "wallet:::" + req.GetUserId()
 	lockRes, err := s.collection.GetAndLock(walletKey, lockDuration, &gocb.GetAndLockOptions{Context: ctx})
@@ -492,8 +491,26 @@ func (s *server) ReserveFunds(ctx context.Context, req *walletpb.ReserveFundsReq
 	if err := lockRes.Content(&w); err != nil {
 		return nil, err
 	}
+	if w.Holds == nil {
+		w.Holds = make(map[string]holdDoc)
+	}
+	if existing, ok := w.Holds[req.GetReservationId()]; ok {
+		_ = s.collection.Unlock(walletKey, lockRes.Cas(), &gocb.UnlockOptions{Context: ctx})
+		if existing.UserID != req.GetUserId() || existing.Amount != req.GetAmountMinor() || existing.Currency != currency {
+			return &walletpb.ReserveFundsResponse{Reserved: false, Reason: "RESERVATION_CONFLICT"}, nil
+		}
+		if existing.Status == "HELD" {
+			// Repair the query projection if the process stopped after changing the wallet document.
+			if _, err := s.collection.Upsert(holdKey, existing, &gocb.UpsertOptions{Context: ctx}); err != nil {
+				return nil, err
+			}
+			return &walletpb.ReserveFundsResponse{Reserved: true, AvailableBalance: w.Available}, nil
+		}
+		return &walletpb.ReserveFundsResponse{Reserved: false, Reason: "RESERVATION_CLOSED"}, nil
+	}
 	w.Available = legacyAvailable(w)
 	if w.Available < req.GetAmountMinor() {
+		_ = s.collection.Unlock(walletKey, lockRes.Cas(), &gocb.UnlockOptions{Context: ctx})
 		return &walletpb.ReserveFundsResponse{Reserved: false, Reason: "INSUFFICIENT_FUNDS", AvailableBalance: w.Available}, nil
 	}
 	ttl := time.Duration(req.GetTtlSeconds()) * time.Second
@@ -502,6 +519,7 @@ func (s *server) ReserveFunds(ctx context.Context, req *walletpb.ReserveFundsReq
 	}
 	now := time.Now().UTC()
 	hold := holdDoc{ReservationID: req.GetReservationId(), UserID: req.GetUserId(), Amount: req.GetAmountMinor(), Currency: currency, Status: "HELD", CreatedAt: now, ExpiresAt: now.Add(ttl)}
+	w.Holds[req.GetReservationId()] = hold
 	w.Available -= req.GetAmountMinor()
 	w.Held += req.GetAmountMinor()
 	w.Currency = currency
@@ -509,10 +527,8 @@ func (s *server) ReserveFunds(ctx context.Context, req *walletpb.ReserveFundsReq
 	if _, err := s.collection.Replace(walletKey, w, &gocb.ReplaceOptions{Cas: lockRes.Cas(), Context: ctx}); err != nil {
 		return nil, err
 	}
-	if _, err := s.collection.Insert(holdKey, hold, &gocb.InsertOptions{Context: ctx}); err != nil {
-		if !errors.Is(err, gocb.ErrDocumentExists) {
-			return nil, err
-		}
+	if _, err := s.collection.Upsert(holdKey, hold, &gocb.UpsertOptions{Context: ctx}); err != nil {
+		return nil, fmt.Errorf("write hold projection: %w", err)
 	}
 	return &walletpb.ReserveFundsResponse{Reserved: true, AvailableBalance: w.Available}, nil
 }
@@ -526,25 +542,16 @@ func (s *server) CaptureReservation(ctx context.Context, req *walletpb.CaptureRe
 	if err != nil {
 		return nil, err
 	}
-	var hold holdDoc
-	if err := res.Content(&hold); err != nil {
+	var projection holdDoc
+	if err := res.Content(&projection); err != nil {
 		return nil, err
 	}
-	if hold.Status == "CAPTURED" {
-		return &walletpb.CaptureReservationResponse{Captured: true}, nil
-	}
-	if hold.Status == "RELEASED" {
-		return &walletpb.CaptureReservationResponse{Captured: false, Reason: "RESERVATION_EXPIRED"}, nil
-	}
-	if time.Now().UTC().After(hold.ExpiresAt) {
-		return &walletpb.CaptureReservationResponse{Captured: false, Reason: "RESERVATION_EXPIRED"}, nil
-	}
 	actual := req.GetActualAmount()
-	if actual < 0 || actual > hold.Amount {
-		actual = hold.Amount
+	if actual < 0 || actual > projection.Amount {
+		return &walletpb.CaptureReservationResponse{Captured: false, Reason: "INVALID_AMOUNT"}, nil
 	}
 
-	walletKey := "wallet:::" + hold.UserID
+	walletKey := "wallet:::" + projection.UserID
 	lockRes, err := s.collection.GetAndLock(walletKey, lockDuration, &gocb.GetAndLockOptions{Context: ctx})
 	if err != nil {
 		return nil, err
@@ -553,25 +560,35 @@ func (s *server) CaptureReservation(ctx context.Context, req *walletpb.CaptureRe
 	if err := lockRes.Content(&w); err != nil {
 		return nil, err
 	}
-	w.Available = legacyAvailable(w)
-	refund := hold.Amount - actual
-	if w.Held < hold.Amount {
+	hold := projection
+	if embedded, ok := w.Holds[req.GetReservationId()]; ok {
+		hold = embedded
+	}
+	if hold.Status == "CAPTURED" {
+		_ = s.collection.Unlock(walletKey, lockRes.Cas(), &gocb.UnlockOptions{Context: ctx})
+		return &walletpb.CaptureReservationResponse{Captured: true, AvailableBalance: legacyAvailable(w)}, nil
+	}
+	if hold.Status == "RELEASED" {
+		_ = s.collection.Unlock(walletKey, lockRes.Cas(), &gocb.UnlockOptions{Context: ctx})
+		return &walletpb.CaptureReservationResponse{Captured: false, Reason: "RESERVATION_EXPIRED"}, nil
+	}
+	if time.Now().UTC().After(hold.ExpiresAt) {
+		_ = s.collection.Unlock(walletKey, lockRes.Cas(), &gocb.UnlockOptions{Context: ctx})
+		return &walletpb.CaptureReservationResponse{Captured: false, Reason: "RESERVATION_EXPIRED"}, nil
+	}
+	if hold.Status != "HELD" || hold.UserID != projection.UserID || hold.Amount != projection.Amount {
+		_ = s.collection.Unlock(walletKey, lockRes.Cas(), &gocb.UnlockOptions{Context: ctx})
 		return &walletpb.CaptureReservationResponse{Captured: false, Reason: "NOT_FOUND"}, nil
 	}
-	w.Held -= hold.Amount
-	w.Available += refund
-	w.UpdatedAt = time.Now().UTC()
-	tx := txDoc{TxID: "tx_" + strings.ReplaceAll(uuid.NewString(), "-", ""), UserID: hold.UserID, Type: "capture", AmountMinor: actual, BalanceAfter: w.Available, Reference: "reservation:" + req.GetReservationId(), Status: "completed", CreatedAt: time.Now().UTC()}
-	w.Ledger = append(w.Ledger, tx)
+	w, hold, err = captureHoldState(w, hold, actual, time.Now().UTC())
+	if err != nil {
+		_ = s.collection.Unlock(walletKey, lockRes.Cas(), &gocb.UnlockOptions{Context: ctx})
+		return &walletpb.CaptureReservationResponse{Captured: false, Reason: err.Error()}, nil
+	}
 	if _, err := s.collection.Replace(walletKey, w, &gocb.ReplaceOptions{Cas: lockRes.Cas(), Context: ctx}); err != nil {
 		return nil, err
 	}
-	hold.Status = "CAPTURED"
-	hold.ExpiresAt = time.Now().UTC()
-	if _, err := s.collection.Replace(holdKey, hold, &gocb.ReplaceOptions{Cas: res.Cas(), Context: ctx}); err != nil && !errors.Is(err, gocb.ErrCasMismatch) {
-		return nil, err
-	}
-	if _, err := s.collection.Insert("transaction:::"+tx.TxID, tx, &gocb.InsertOptions{Context: ctx}); err != nil && !errors.Is(err, gocb.ErrDocumentExists) {
+	if _, err := s.collection.Upsert(holdKey, hold, &gocb.UpsertOptions{Context: ctx}); err != nil {
 		return nil, err
 	}
 	return &walletpb.CaptureReservationResponse{Captured: true, AvailableBalance: w.Available}, nil
@@ -586,18 +603,12 @@ func (s *server) ReleaseReservation(ctx context.Context, req *walletpb.ReleaseRe
 	if err != nil {
 		return nil, err
 	}
-	var hold holdDoc
-	if err := res.Content(&hold); err != nil {
+	var projection holdDoc
+	if err := res.Content(&projection); err != nil {
 		return nil, err
 	}
-	if hold.Status == "RELEASED" {
-		return &walletpb.ReleaseReservationResponse{Released: true, Reason: "RELEASED"}, nil
-	}
-	if hold.Status == "CAPTURED" {
-		return &walletpb.ReleaseReservationResponse{Released: false, Reason: "RESERVATION_CAPTURED"}, nil
-	}
 
-	walletKey := "wallet:::" + hold.UserID
+	walletKey := "wallet:::" + projection.UserID
 	lockRes, err := s.collection.GetAndLock(walletKey, lockDuration, &gocb.GetAndLockOptions{Context: ctx})
 	if err != nil {
 		return nil, err
@@ -606,21 +617,101 @@ func (s *server) ReleaseReservation(ctx context.Context, req *walletpb.ReleaseRe
 	if err := lockRes.Content(&w); err != nil {
 		return nil, err
 	}
-	w.Available = legacyAvailable(w)
-	if w.Held >= hold.Amount {
-		w.Held -= hold.Amount
-		w.Available += hold.Amount
+	hold := projection
+	if embedded, ok := w.Holds[req.GetReservationId()]; ok {
+		hold = embedded
 	}
-	w.UpdatedAt = time.Now().UTC()
+	if hold.Status == "RELEASED" {
+		_ = s.collection.Unlock(walletKey, lockRes.Cas(), &gocb.UnlockOptions{Context: ctx})
+		return &walletpb.ReleaseReservationResponse{Released: true, Reason: "RELEASED", AvailableBalance: legacyAvailable(w)}, nil
+	}
+	if hold.Status == "CAPTURED" {
+		_ = s.collection.Unlock(walletKey, lockRes.Cas(), &gocb.UnlockOptions{Context: ctx})
+		return &walletpb.ReleaseReservationResponse{Released: false, Reason: "RESERVATION_CAPTURED", AvailableBalance: legacyAvailable(w)}, nil
+	}
+	if hold.Status != "HELD" || hold.UserID != projection.UserID || hold.Amount != projection.Amount {
+		_ = s.collection.Unlock(walletKey, lockRes.Cas(), &gocb.UnlockOptions{Context: ctx})
+		return &walletpb.ReleaseReservationResponse{Released: false, Reason: "NOT_FOUND"}, nil
+	}
+	w, hold, err = releaseHoldState(w, hold, time.Now().UTC())
+	if err != nil {
+		_ = s.collection.Unlock(walletKey, lockRes.Cas(), &gocb.UnlockOptions{Context: ctx})
+		return &walletpb.ReleaseReservationResponse{Released: false, Reason: err.Error()}, nil
+	}
 	if _, err := s.collection.Replace(walletKey, w, &gocb.ReplaceOptions{Cas: lockRes.Cas(), Context: ctx}); err != nil {
 		return nil, err
 	}
-	hold.Status = "RELEASED"
-	if _, err := s.collection.Replace(holdKey, hold, &gocb.ReplaceOptions{Cas: res.Cas(), Context: ctx}); err != nil && !errors.Is(err, gocb.ErrCasMismatch) {
+	if _, err := s.collection.Upsert(holdKey, hold, &gocb.UpsertOptions{Context: ctx}); err != nil {
 		return nil, err
 	}
 	return &walletpb.ReleaseReservationResponse{Released: true, AvailableBalance: w.Available}, nil
 }
+
+func captureHoldState(wallet walletDoc, hold holdDoc, actual int64, now time.Time) (walletDoc, holdDoc, error) {
+	if hold.Status != "HELD" {
+		return wallet, hold, fmt.Errorf("RESERVATION_EXPIRED")
+	}
+	if now.After(hold.ExpiresAt) {
+		return wallet, hold, fmt.Errorf("RESERVATION_EXPIRED")
+	}
+	if actual < 0 || actual > hold.Amount {
+		return wallet, hold, fmt.Errorf("INVALID_AMOUNT")
+	}
+	if wallet.Held < hold.Amount {
+		return wallet, hold, fmt.Errorf("HELD_BALANCE_INCONSISTENT")
+	}
+	wallet.Available = legacyAvailable(wallet) + hold.Amount - actual
+	wallet.Held -= hold.Amount
+	wallet.UpdatedAt = now
+	hold.Status = "CAPTURED"
+	hold.ExpiresAt = now
+	if wallet.Holds == nil {
+		wallet.Holds = make(map[string]holdDoc)
+	}
+	wallet.Holds[hold.ReservationID] = hold
+	wallet.Ledger = append(wallet.Ledger, txDoc{
+		TxID:         "tx_" + strings.ReplaceAll(uuid.NewString(), "-", ""),
+		UserID:       hold.UserID,
+		Type:         "capture",
+		AmountMinor:  actual,
+		BalanceAfter: wallet.Available,
+		Reference:    "reservation:" + hold.ReservationID,
+		Status:       "completed",
+		CreatedAt:    now,
+	})
+	return wallet, hold, nil
+}
+
+func releaseHoldState(wallet walletDoc, hold holdDoc, now time.Time) (walletDoc, holdDoc, error) {
+	if hold.Status != "HELD" {
+		return wallet, hold, fmt.Errorf("RESERVATION_CLOSED")
+	}
+	if wallet.Held < hold.Amount {
+		return wallet, hold, fmt.Errorf("HELD_BALANCE_INCONSISTENT")
+	}
+	wallet.Available = legacyAvailable(wallet) + hold.Amount
+	wallet.Held -= hold.Amount
+	wallet.UpdatedAt = now
+	hold.Status = "RELEASED"
+	hold.ExpiresAt = now
+	if wallet.Holds == nil {
+		wallet.Holds = make(map[string]holdDoc)
+	}
+	wallet.Holds[hold.ReservationID] = hold
+	wallet.Ledger = append(wallet.Ledger, txDoc{
+		TxID:         "tx_" + strings.ReplaceAll(uuid.NewString(), "-", ""),
+		UserID:       hold.UserID,
+		Type:         "release",
+		AmountMinor:  hold.Amount,
+		BalanceAfter: wallet.Available,
+		Reference:    "reservation:" + hold.ReservationID,
+		Status:       "completed",
+		CreatedAt:    now,
+	})
+	return wallet, hold, nil
+}
+
+const holdSweepBatchSize = 100
 
 func (s *server) runSweeper(ctx context.Context) {
 	ticker := time.NewTicker(s.cfg.SweepInterval)
@@ -636,8 +727,8 @@ func (s *server) runSweeper(ctx context.Context) {
 }
 
 func sweepHeld(ctx context.Context, s *server) {
-	statement := fmt.Sprintf("SELECT META().id AS id, reservation_id, user_id, amount, status, expires_at FROM `%s` WHERE status = 'HELD' AND expires_at < $now", s.cfg.CouchbaseBucket)
-	result, err := s.cluster.Query(statement, &gocb.QueryOptions{Context: ctx, NamedParameters: map[string]any{"now": time.Now().UTC().Format(time.RFC3339)}})
+	statement := fmt.Sprintf("SELECT META().id AS id, reservation_id FROM `%s` WHERE META().id LIKE 'hold::%%' AND status = 'HELD' AND expires_at < $now LIMIT $batch", s.cfg.CouchbaseBucket)
+	result, err := s.cluster.Query(statement, &gocb.QueryOptions{Context: ctx, NamedParameters: map[string]any{"now": time.Now().UTC().Format(time.RFC3339), "batch": holdSweepBatchSize}})
 	if err != nil {
 		s.logger.Error("hold sweeper query failed", slog.String("error", err.Error()))
 		return
@@ -649,12 +740,20 @@ func sweepHeld(ctx context.Context, s *server) {
 			ReservationID string `json:"reservation_id"`
 		}
 		if err := result.Row(&row); err != nil {
+			s.logger.Error("hold sweeper row decode failed", slog.String("error", err.Error()))
+			continue
+		}
+		if row.ReservationID == "" {
+			s.logger.Error("hold sweeper encountered hold without reservation id", slog.String("document_id", row.ID))
 			continue
 		}
 		_, err := s.ReleaseReservation(ctx, &walletpb.ReleaseReservationRequest{ReservationId: row.ReservationID})
 		if err != nil {
 			s.logger.Error("hold release failed", slog.String("reservation_id", row.ReservationID), slog.String("error", err.Error()))
 		}
+	}
+	if err := result.Err(); err != nil {
+		s.logger.Error("hold sweeper iteration failed", slog.String("error", err.Error()))
 	}
 }
 

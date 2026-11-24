@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/apibilling/platform/pkg/events"
 )
@@ -14,6 +16,75 @@ func TestLegacyFloatToMinorUnits(t *testing.T) {
 	}
 	if got := legacyFloatToMinorUnits(12.6); got != 13 {
 		t.Fatalf("12.6 converted to %d, want 13", got)
+	}
+}
+
+func TestExpiredHoldReleaseRestoresBalances(t *testing.T) {
+	now := time.Now().UTC()
+	wallet := walletDoc{UserID: "u", Available: 2, Held: 3}
+	hold := holdDoc{ReservationID: "r", UserID: "u", Amount: 3, Status: "HELD", ExpiresAt: now.Add(-time.Second)}
+	updated, released, err := releaseHoldState(wallet, hold, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Available != 5 || updated.Held != 0 || released.Status != "RELEASED" {
+		t.Fatalf("wallet=%+v hold=%+v", updated, released)
+	}
+}
+
+func TestSweeperDoesNotChangeClosedHolds(t *testing.T) {
+	now := time.Now().UTC()
+	for _, status := range []string{"CAPTURED", "RELEASED"} {
+		t.Run(status, func(t *testing.T) {
+			wallet := walletDoc{UserID: "u", Available: 7, Held: 0}
+			hold := holdDoc{ReservationID: "r", UserID: "u", Amount: 3, Status: status, ExpiresAt: now.Add(-time.Hour)}
+			updated, _, err := releaseHoldState(wallet, hold, now)
+			if err == nil {
+				t.Fatal("closed hold must not be released")
+			}
+			if updated.Available != wallet.Available || updated.Held != wallet.Held {
+				t.Fatalf("closed hold moved funds: before=%+v after=%+v", wallet, updated)
+			}
+		})
+	}
+}
+
+func TestSweeperRacingCaptureMovesFundsOnce(t *testing.T) {
+	now := time.Now().UTC()
+	state := walletDoc{UserID: "u", Available: 0, Held: 3, Holds: map[string]holdDoc{}}
+	hold := holdDoc{ReservationID: "r", UserID: "u", Amount: 3, Status: "HELD", ExpiresAt: now.Add(time.Hour)}
+	state.Holds[hold.ReservationID] = hold
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		mu.Lock()
+		defer mu.Unlock()
+		current := state.Holds[hold.ReservationID]
+		updated, next, err := captureHoldState(state, current, 3, now)
+		if err == nil {
+			state = updated
+			state.Holds[hold.ReservationID] = next
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		mu.Lock()
+		defer mu.Unlock()
+		current := state.Holds[hold.ReservationID]
+		updated, next, err := releaseHoldState(state, current, now)
+		if err == nil {
+			state = updated
+			state.Holds[hold.ReservationID] = next
+		}
+	}()
+	wg.Wait()
+	if state.Held != 0 || (state.Available != 0 && state.Available != 3) {
+		t.Fatalf("funds moved more than once: available=%d held=%d", state.Available, state.Held)
+	}
+	if got := state.Holds[hold.ReservationID].Status; got != "CAPTURED" && got != "RELEASED" {
+		t.Fatalf("final hold status=%s", got)
 	}
 }
 
