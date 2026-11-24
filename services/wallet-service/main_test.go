@@ -5,15 +5,189 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"os"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/apibilling/platform/pkg/events"
+	walletpb "github.com/apibilling/platform/proto/wallet"
 	"github.com/couchbase/gocb/v2"
+	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
+
+func integrationWallet(t *testing.T, available int64) (*server, string, func(string)) {
+	t.Helper()
+	if os.Getenv("WALLET_COUCHBASE_INTEGRATION") != "1" {
+		t.Skip("set WALLET_COUCHBASE_INTEGRATION=1 to run Couchbase integration tests")
+	}
+	host := os.Getenv("COUCHBASE_HOST")
+	username := os.Getenv("COUCHBASE_USERNAME")
+	password := os.Getenv("COUCHBASE_PASSWORD")
+	bucketName := os.Getenv("COUCHBASE_BUCKET")
+	if host == "" || username == "" || password == "" || bucketName == "" {
+		t.Fatal("Couchbase integration environment is incomplete")
+	}
+	cluster, err := gocb.Connect(host, gocb.ClusterOptions{Authenticator: gocb.PasswordAuthenticator{Username: username, Password: password}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bucket := cluster.Bucket(bucketName)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := bucket.WaitUntilReady(30*time.Second, &gocb.WaitUntilReadyOptions{Context: ctx}); err != nil {
+		cluster.Close(nil)
+		t.Fatal(err)
+	}
+	collection := bucket.DefaultCollection()
+	userID := "race-test-" + uuid.NewString()
+	walletKey := "wallet:::" + userID
+	if _, err := collection.Insert(walletKey, walletDoc{UserID: userID, Available: available}, nil); err != nil {
+		cluster.Close(nil)
+		t.Fatal(err)
+	}
+	var holdMu sync.Mutex
+	holdIDs := make([]string, 0)
+	t.Cleanup(func() {
+		holdMu.Lock()
+		defer holdMu.Unlock()
+		for _, reservationID := range holdIDs {
+			_, _ = collection.Remove("hold:::"+reservationID, nil)
+		}
+		_, _ = collection.Remove(walletKey, nil)
+		cluster.Close(nil)
+	})
+	svc := &server{
+		cfg:        configType{HoldTTL: 5 * time.Minute},
+		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		cluster:    cluster,
+		collection: collection,
+	}
+	trackHold := func(reservationID string) {
+		holdMu.Lock()
+		holdIDs = append(holdIDs, reservationID)
+		holdMu.Unlock()
+	}
+	return svc, userID, trackHold
+}
+
+func TestConcurrentReserveFundsIntegration(t *testing.T) {
+	svc, userID, trackHold := integrationWallet(t, 3)
+	const requestCount = 20
+	start := make(chan struct{})
+	results := make(chan struct {
+		response *walletpb.ReserveFundsResponse
+		err      error
+	}, requestCount)
+	var wg sync.WaitGroup
+	for i := 0; i < requestCount; i++ {
+		reservationID := uuid.NewString()
+		trackHold(reservationID)
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			<-start
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			response, err := svc.ReserveFunds(ctx, &walletpb.ReserveFundsRequest{
+				UserId: userID, AmountMinor: 3, ReservationId: id, Currency: "INR",
+			})
+			results <- struct {
+				response *walletpb.ReserveFundsResponse
+				err      error
+			}{response: response, err: err}
+		}(reservationID)
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	successes := 0
+	for result := range results {
+		if result.err != nil {
+			t.Fatalf("ReserveFunds returned error under contention: type=%T err=%v", result.err, result.err)
+		}
+		if result.response.GetReserved() {
+			successes++
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("successful reservations=%d, want 1", successes)
+	}
+	res, err := svc.collection.Get("wallet:::"+userID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wallet walletDoc
+	if err := res.Content(&wallet); err != nil {
+		t.Fatal(err)
+	}
+	if wallet.Available != 0 || wallet.Held != 3 {
+		t.Fatalf("final wallet available=%d held=%d, want 0 and 3", wallet.Available, wallet.Held)
+	}
+}
+
+func TestReservationCallsAreIdempotentIntegration(t *testing.T) {
+	svc, userID, trackHold := integrationWallet(t, 10)
+	reservationID := uuid.NewString()
+	trackHold(reservationID)
+	reserveReq := &walletpb.ReserveFundsRequest{UserId: userID, AmountMinor: 3, ReservationId: reservationID, Currency: "INR"}
+	for i := 0; i < 2; i++ {
+		response, err := svc.ReserveFunds(context.Background(), reserveReq)
+		if err != nil || !response.GetReserved() {
+			t.Fatalf("reserve replay %d: response=%v err=%v", i, response, err)
+		}
+	}
+	for i := 0; i < 2; i++ {
+		response, err := svc.CaptureReservation(context.Background(), &walletpb.CaptureReservationRequest{ReservationId: reservationID, ActualAmount: 3})
+		if err != nil || !response.GetCaptured() {
+			t.Fatalf("capture replay %d: response=%v err=%v", i, response, err)
+		}
+	}
+	releaseAfterCapture, err := svc.ReleaseReservation(context.Background(), &walletpb.ReleaseReservationRequest{ReservationId: reservationID})
+	if err != nil || releaseAfterCapture.GetReleased() {
+		t.Fatalf("release after capture: response=%v err=%v", releaseAfterCapture, err)
+	}
+
+	releasedID := uuid.NewString()
+	trackHold(releasedID)
+	releaseReq := &walletpb.ReleaseReservationRequest{ReservationId: releasedID}
+	if response, err := svc.ReserveFunds(context.Background(), &walletpb.ReserveFundsRequest{UserId: userID, AmountMinor: 2, ReservationId: releasedID, Currency: "INR"}); err != nil || !response.GetReserved() {
+		t.Fatalf("reserve for release: response=%v err=%v", response, err)
+	}
+	for i := 0; i < 2; i++ {
+		response, err := svc.ReleaseReservation(context.Background(), releaseReq)
+		if err != nil || !response.GetReleased() {
+			t.Fatalf("release replay %d: response=%v err=%v", i, response, err)
+		}
+	}
+	expiredID := uuid.NewString()
+	trackHold(expiredID)
+	if response, err := svc.ReserveFunds(context.Background(), &walletpb.ReserveFundsRequest{UserId: userID, AmountMinor: 1, ReservationId: expiredID, TtlSeconds: 1, Currency: "INR"}); err != nil || !response.GetReserved() {
+		t.Fatalf("reserve for expiry: response=%v err=%v", response, err)
+	}
+	time.Sleep(1100 * time.Millisecond)
+	expired, err := svc.CaptureReservation(context.Background(), &walletpb.CaptureReservationRequest{ReservationId: expiredID, ActualAmount: 1})
+	if err != nil || expired.GetCaptured() || expired.GetReason() != "RESERVATION_EXPIRED" {
+		t.Fatalf("capture after expiry: response=%v err=%v", expired, err)
+	}
+	if response, err := svc.ReleaseReservation(context.Background(), &walletpb.ReleaseReservationRequest{ReservationId: expiredID}); err != nil || !response.GetReleased() {
+		t.Fatalf("release expired reservation: response=%v err=%v", response, err)
+	}
+
+	res, err := svc.collection.Get("wallet:::"+userID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wallet walletDoc
+	if err := res.Content(&wallet); err != nil {
+		t.Fatal(err)
+	}
+	if wallet.Available != 7 || wallet.Held != 0 || len(wallet.Ledger) != 3 {
+		t.Fatalf("final wallet available=%d held=%d ledger=%d, want 7, 0, 3", wallet.Available, wallet.Held, len(wallet.Ledger))
+	}
+}
 
 func TestWalletMutationRetriesLockContention(t *testing.T) {
 	svc := &server{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
@@ -21,7 +195,7 @@ func TestWalletMutationRetriesLockContention(t *testing.T) {
 	err := svc.retryWalletOperation(context.Background(), "test", func(context.Context) error {
 		attempts++
 		if attempts < 3 {
-			return gocb.ErrDocumentLocked
+			return errorString(`ambiguous timeout; "retry_reasons":["KV_LOCKED"]`)
 		}
 		return nil
 	})
