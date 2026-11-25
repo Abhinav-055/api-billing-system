@@ -249,10 +249,6 @@ Health:
 2. GET /health (payment-service)
 3. GET /health (billing-service)
 
-Auth:
-1. POST /auth/register
-2. POST /auth/login
-
 Payments:
 1. POST /payments/create-order
 2. POST /payments/confirm
@@ -270,6 +266,56 @@ Keys:
 Usage:
 1. GET /api/v1/usage/summary
 2. GET /api/v1/usage/logs
+
+## API Reference
+
+For local use, the API gateway base URL is `http://localhost:8080`. The data and compute
+endpoints require an API key in the `X-API-Key` header.
+
+### Sample data
+
+`GET /api/v1/data` returns a sample payload. It costs **1 credit** per successful
+request and records usage.
+
+```http
+GET http://localhost:8080/api/v1/data
+X-API-Key: {{apiKey}}
+```
+
+Example response:
+
+```json
+{
+  "message": "sample response",
+  "request_id": "request-id",
+  "timestamp": "2026-01-01T12:00:00Z"
+}
+```
+
+### Compute
+
+`GET /api/v1/compute` returns a sample computation result. It costs **3 credits**
+per successful request and records usage.
+
+```http
+GET http://localhost:8080/api/v1/compute
+X-API-Key: {{apiKey}}
+```
+
+Example response:
+
+```json
+{
+  "result": "compute complete",
+  "request_id": "request-id",
+  "timestamp": "2026-01-01T12:00:00Z"
+}
+```
+
+Both metered endpoints can return `401 Unauthorized` for a missing or invalid API key,
+`402 Payment Required` when the wallet balance is insufficient, `429 Too Many Requests` when
+rate-limited, or `503 Service Unavailable` when the wallet is unavailable. A new account needs
+sufficient wallet balance before calling them; repeated GET requests are billable.
 
 ## Test and Validation
 
@@ -295,9 +341,9 @@ make integration-test
 
 ## Troubleshooting Quick Guide
 
-If register/login fails:
+If a data or compute request fails:
 1. Ensure api-gateway is up and healthy.
-2. Ensure nginx routes /api to frontend (Next.js server routes).
+2. Ensure the request includes a valid `X-API-Key` header and the wallet has enough credits.
 
 If payment succeeds in Razorpay but no transaction appears:
 1. Check /payments/confirm response in frontend network tab.
