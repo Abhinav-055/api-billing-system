@@ -172,27 +172,33 @@ Ports:
 Frontend:
 1. NEXT_PUBLIC_BACKEND_URL=http://nginx
 
-## Setup and Run (Clear Steps)
+## Setup and Run
 
-### Step 1: Start backend + infra
+### Step 1: Configure local environment
+
+If you do not already have a root `.env` file, create one from the example:
 
 ```powershell
-docker compose up -d redis nats couchbase api-gateway wallet-service billing-service payment-service
+Copy-Item .env.example .env
+```
+
+Set `COUCHBASE_HOST=couchbase://couchbase`, and fill in the required secrets in `.env`.
+Use Razorpay test credentials to exercise payments. For local development, set
+`COUCHBASE_USERNAME=Administrator` and `COUCHBASE_PASSWORD=password`; use the same credentials
+when initializing Couchbase below.
+
+### Step 2: Start infrastructure
+
+```powershell
+docker compose up -d couchbase redis nats
 docker compose ps
 ```
 
-### Step 2: Initialize Couchbase bucket and indexes
+Wait for Couchbase to finish starting, then open `http://localhost:8091`. On first launch,
+complete the setup wizard and create the `Administrator` account using the username and password
+from `.env`. Create a bucket named `apibilling`.
 
-Open `http://localhost:8091`
-
-Login:
-1. Username: Administrator
-2. Password: password
-
-Create bucket:
-1. Name: apibilling
-
-Create primary index in Query Workbench:
+Create a primary index in Query Workbench:
 
 ```sql
 CREATE PRIMARY INDEX `idx_primary_apibilling` ON `apibilling`;
@@ -208,17 +214,23 @@ CREATE INDEX `idx_usage_user_time` ON `apibilling`(user_id, timestamp DESC)
 WHERE META().id LIKE "usage:::%";
 ```
 
-### Step 3: Start frontend + nginx
+### Step 3: Build and start the application
 
 ```powershell
-docker compose up -d frontend nginx
+docker compose up --build -d
 docker compose ps
 ```
 
-Open:
+This builds and starts all services, including the frontend and nginx. Open:
 1. App: http://localhost
 2. Frontend direct: http://localhost:3000
 3. API gateway health: http://localhost:8080/health
+
+To stop the services without deleting persisted database data:
+
+```powershell
+docker compose down
+```
 
 ## Webhook Setup (Razorpay Dashboard)
 
