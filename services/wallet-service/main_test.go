@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -465,12 +466,51 @@ func TestWalletMutationContentionExhaustionIsRetryable(t *testing.T) {
 	}
 }
 
-func TestLegacyFloatToMinorUnits(t *testing.T) {
-	if got := legacyFloatToMinorUnits(12.4); got != 12 {
-		t.Fatalf("12.4 converted to %d, want 12", got)
+func TestParseLegacyWalletAmountRequiresExactInt64(t *testing.T) {
+	for _, tc := range []struct {
+		value string
+		want  int64
+	}{
+		{value: "0", want: 0},
+		{value: "12", want: 12},
+		{value: "9223372036854775807", want: 9223372036854775807},
+	} {
+		got, err := parseLegacyWalletAmount(json.Number(tc.value))
+		if err != nil || got != tc.want {
+			t.Errorf("parseLegacyWalletAmount(%q)=(%d,%v), want (%d,nil)", tc.value, got, err, tc.want)
+		}
 	}
-	if got := legacyFloatToMinorUnits(12.6); got != 13 {
-		t.Fatalf("12.6 converted to %d, want 13", got)
+	for _, value := range []string{"12.4", "-1", "9223372036854775808", "1e3"} {
+		if got, err := parseLegacyWalletAmount(json.Number(value)); err == nil {
+			t.Errorf("parseLegacyWalletAmount(%q)=(%d,nil), want error", value, got)
+		}
+	}
+}
+
+func TestEnsureWalletRejectsFractionalLegacyAmountIntegration(t *testing.T) {
+	svc, _, _ := integrationWallet(t, 0)
+	userID := "legacy-wallet-" + uuid.NewString()
+	key := "wallet:::" + userID
+	raw := json.RawMessage(`{"user_id":"` + userID + `","available":12.4,"currency":"INR"}`)
+	if _, err := svc.collection.Insert(key, raw, nil); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = svc.collection.Remove(key, nil)
+	})
+	if _, err := svc.ensureWallet(context.Background(), userID, "INR"); err == nil {
+		t.Fatal("fractional legacy amount was silently accepted")
+	}
+	result, err := svc.collection.Get(key, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted map[string]json.RawMessage
+	if err := result.Content(&persisted); err != nil {
+		t.Fatal(err)
+	}
+	if string(persisted["available"]) != "12.4" {
+		t.Fatalf("fractional legacy amount changed during rejected migration: %s", persisted["available"])
 	}
 }
 

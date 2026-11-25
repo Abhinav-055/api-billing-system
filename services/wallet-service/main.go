@@ -8,12 +8,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"math"
 	"math/rand"
 	"net"
 	"net/http"
 	"os"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"time"
 
@@ -281,8 +281,15 @@ func legacyAvailable(w walletDoc) int64 {
 	return 0
 }
 
-func legacyFloatToMinorUnits(value float64) int64 {
-	return int64(math.Round(value))
+func parseLegacyWalletAmount(value json.Number) (int64, error) {
+	if value == "" {
+		return 0, nil
+	}
+	amount, err := strconv.ParseInt(value.String(), 10, 64)
+	if err != nil || amount < 0 {
+		return 0, fmt.Errorf("legacy wallet amount %q is not a non-negative int64", value)
+	}
+	return amount, nil
 }
 
 func (s *server) ensureWallet(ctx context.Context, userID, currency string) (walletDoc, error) {
@@ -301,31 +308,37 @@ func (s *server) ensureWallet(ctx context.Context, userID, currency string) (wal
 	}
 	var w walletDoc
 	if err := res.Content(&w); err != nil {
-		var raw map[string]any
+		var raw struct {
+			UserID    string      `json:"user_id"`
+			Available json.Number `json:"available"`
+			Balance   json.Number `json:"balance"`
+			Held      json.Number `json:"held"`
+			Currency  string      `json:"currency"`
+		}
 		if rawErr := res.Content(&raw); rawErr != nil {
 			return walletDoc{}, err
 		}
-		w.UserID, _ = raw["user_id"].(string)
-		switch value := raw["available"].(type) {
-		case float64:
-			w.Available = legacyFloatToMinorUnits(value)
-		case int64:
-			w.Available = value
-		}
-		if w.Available == 0 {
-			if value, ok := raw["balance"].(float64); ok {
-				w.Available = legacyFloatToMinorUnits(value)
+		availableValue := raw.Available
+		if availableValue == "" || availableValue == "0" {
+			if raw.Balance != "" {
+				availableValue = raw.Balance
 			}
 		}
-		w.Currency, _ = raw["currency"].(string)
+		available, parseErr := parseLegacyWalletAmount(availableValue)
+		if parseErr != nil {
+			return walletDoc{}, parseErr
+		}
+		held, parseErr := parseLegacyWalletAmount(raw.Held)
+		if parseErr != nil {
+			return walletDoc{}, parseErr
+		}
+		w = walletDoc{UserID: raw.UserID, Available: available, Held: held, Currency: raw.Currency}
 		w.UpdatedAt = time.Now().UTC()
-		s.logger.Info("migrated legacy wallet float to int64", slog.String("user_id", w.UserID), slog.Int64("available", w.Available))
+		s.logger.Info("migrated legacy wallet amounts to int64", slog.String("user_id", w.UserID), slog.Int64("available", w.Available))
 		if migrationErr := s.migrateLegacyWallet(ctx, "wallet:::"+userID, w); migrationErr != nil {
 			return walletDoc{}, migrationErr
 		}
 	}
-	// Migration-safe legacy float reader: Couchbase decoding of a JSON float into int64 fails,
-	// so raw float-shaped documents are normalized here by re-reading and replacing before use.
 	w.Available = legacyAvailable(w)
 	if w.Currency == "" {
 		w.Currency = "INR"
